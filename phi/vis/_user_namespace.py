@@ -171,6 +171,8 @@ class LocalNamespace(UserNamespace):
     def get_description(self):
         if self.function is not None and self.function.__doc__:
             return self.function.__doc__
+        elif self.module is None:   # fix for jupyter notebook 
+            return f""
         else:
             return f"Function `{self.function_name}()` in '{self.module.__file__}'"
 

@@ -7,7 +7,7 @@ from ..math import Tensor
 from ..math._shape import merge_shapes
 from ..math._magic_ops import variable_attributes, copy_with
 from ..math.magic import PhiTreeNode
-
+from ._polygon import AdapterPolygon
 
 class Union(Geometry):
 
@@ -91,6 +91,13 @@ def union(*geometries) -> Geometry:
         return NO_GEOMETRY
     elif len(geometries) == 1:
         return geometries[0]
+    
+    elif any(isinstance(g, AdapterPolygon) for g in geometries):
+        base_geometries = ()
+        for geometry in geometries:
+            base_geometries += geometry.geometries if isinstance(geometry, Union) else (geometry,)
+        return Union(base_geometries)
+
     elif all(type(g) == type(geometries[0]) and isinstance(g, PhiTreeNode) for g in geometries):
         attrs = variable_attributes(geometries[0])
         values = {a: math.stack([getattr(g, a) for g in geometries], math.instance('union')) for a in attrs}

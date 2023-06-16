@@ -1,0 +1,41 @@
+Metadata-Version: 2.1
+Name: phiflow
+Version: 2.3.4
+Summary: Differentiable PDE solving framework for machine learning
+Home-page: https://github.com/tum-pbs/PhiFlow
+Download-URL: https://github.com/tum-pbs/PhiFlow/archive/2.3.4.tar.gz
+Author: Philipp Holl
+Author-email: philipp.holl@tum.de
+License: MIT
+Keywords: Differentiable,Simulation,Fluid,Machine Learning,Deep Learning
+Platform: UNKNOWN
+Classifier: Development Status :: 5 - Production/Stable
+Classifier: Intended Audience :: Developers
+Classifier: Topic :: Software Development :: Build Tools
+Classifier: License :: OSI Approved :: MIT License
+Classifier: Programming Language :: Python :: 3
+Classifier: Programming Language :: Python :: 3.6
+Classifier: Programming Language :: Python :: 3.7
+Classifier: Programming Language :: Python :: 3.8
+Classifier: Programming Language :: Python :: 3.9
+Classifier: Programming Language :: Python :: 3.10
+Description-Content-Type: text/markdown
+License-File: LICENSE.txt
+
+# PhiFlow
+
+[**Homepage**](https://github.com/tum-pbs/PhiFlow)
+&nbsp;&nbsp;&nbsp; [**Documentation**](https://tum-pbs.github.io/PhiFlow/)
+&nbsp;&nbsp;&nbsp; [**API**](https://tum-pbs.github.io/PhiFlow/phi)
+&nbsp;&nbsp;&nbsp; [**Demos**](https://github.com/tum-pbs/PhiFlow/tree/master/demos)
+&nbsp;&nbsp;&nbsp; [<img src="https://www.tensorflow.org/images/colab_logo_32px.png" height=16> **Fluids Tutorial**](https://colab.research.google.com/github/tum-pbs/PhiFlow/blob/develop/docs/Fluids_Tutorial.ipynb#offline=true&sandboxMode=true)
+&nbsp;&nbsp;&nbsp; [<img src="https://www.tensorflow.org/images/colab_logo_32px.png" height=16> **Playground**](https://colab.research.google.com/drive/1zBlQbmNguRt-Vt332YvdTqlV4DBcus2S#offline=true&sandboxMode=true)
+
+PhiFlow is an open-source simulation toolkit built for optimization and machine learning applications.
+It is written mostly in Python and can be used with NumPy, TensorFlow, Jax or PyTorch.
+The close integration with machine learning frameworks allows it to leverage their automatic differentiation functionality,
+making it easy to build end-to-end differentiable functions involving both learning models and physics simulations.
+
+See the [installation Instructions](https://tum-pbs.github.io/PhiFlow/Installation_Instructions.html) on how to compile the optional custom CUDA operations.
+
+

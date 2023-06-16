@@ -2,9 +2,7 @@ import logging
 import os
 import traceback
 
-import dash_core_components as dcc
-import dash_html_components as html
-from dash.dependencies import Output, Input
+from dash import html, dcc, Output, Input
 from dash.exceptions import PreventUpdate
 from plotly import graph_objects
 

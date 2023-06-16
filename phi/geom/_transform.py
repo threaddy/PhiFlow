@@ -7,7 +7,7 @@ from . import BaseBox, Box
 from ._geom import Geometry
 from ._sphere import Sphere
 from ..math._shape import parse_dim_order
-
+from ._polygon import AdapterPolygon
 
 class RotatedGeometry(Geometry):
 
@@ -232,3 +232,17 @@ def infinite_cylinder(center=None, radius=None, inf_dim: Union[str, Shape, tuple
     """
     sphere = Sphere(center, radius, **center_)
     return embed(sphere, inf_dim)
+
+
+def infinite_polygon(polygon: AdapterPolygon, inf_dim: Union[str, Shape, tuple, list] = None) -> Geometry:
+    """
+    Creates an infinite polygon.
+    This is equal to embedding an `n`-dimensional `Polygon` in `n+1` dimensions.
+
+    See Also:
+        `Sphere`, `embed`
+
+    Returns:
+        `Geometry`
+    """
+    return embed(polygon, inf_dim)

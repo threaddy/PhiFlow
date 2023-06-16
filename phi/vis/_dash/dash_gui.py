@@ -1,8 +1,6 @@
 import warnings
 
-import dash_core_components as dcc
-import dash_html_components as html
-from dash.dependencies import Output
+from dash import html, dcc, Output
 
 from .board import build_benchmark, build_system_controls, \
     build_graph_view
