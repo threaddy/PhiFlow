@@ -5,9 +5,10 @@ from typing import Callable, List, Tuple, Optional, Union
 from phi import geom
 from phi import math
 from phi.geom import Box, Geometry
-from phi.math import Tensor, spatial, instance, tensor, channel, Shape, unstack, solve_linear, jit_compile_linear, shape, Solve, extrapolation, jit_compile
+from phi.math import Tensor, spatial, instance, tensor, channel, Shape, unstack, solve_linear, jit_compile_linear, shape, Solve, extrapolation, jit_compile, rename_dims, flatten, batch
 from ._field import Field, SampledField, SampledFieldType, as_extrapolation
 from ._grid import CenteredGrid, Grid, StaggeredGrid, GridType
+from ._mesh import Mesh
 from ._point_cloud import PointCloud
 from ..math.extrapolation import Extrapolation, SYMMETRIC, REFLECT, ANTIREFLECT, ANTISYMMETRIC, combine_by_direction
 
@@ -166,7 +167,7 @@ def spatial_gradient(field: CenteredGrid,
     if implicit:
         gradient_extrapolation = extrapolation.map(_ex_map_f(extrap_map_rhs), gradient_extrapolation)
     spatial_dims = field.shape.only(dims).names
-    stack_dim = stack_dim._with_item_names((spatial_dims,))
+    stack_dim = stack_dim.with_size(spatial_dims)
     if type == CenteredGrid:
         # ToDo if extrapolation == math.extrapolation.NONE, extend size by 1
         # pad = 1 if extrapolation == math.extrapolation.NONE else 0
@@ -405,9 +406,6 @@ def curl(field: Grid, type: type = CenteredGrid):
             return field.with_values(c)
     elif isinstance(field, StaggeredGrid) and field.spatial_rank == 2:
         if type == CenteredGrid:
-            for dim in field.resolution.names:
-                l, u = field.extrapolation.valid_outer_faces(dim)
-                assert l == u, "periodic extrapolation not yet supported"
             values = bake_extrapolation(field).values
             x_padded = math.pad(values.vector['x'], {'y': (1, 1)}, field.extrapolation)
             y_padded = math.pad(values.vector['y'], {'x': (1, 1)}, field.extrapolation)
@@ -843,3 +841,53 @@ def mask(obj: Union[SampledFieldType, Geometry]) -> SampledFieldType:
         return obj.with_values(values)
     else:
         raise ValueError(obj)
+
+
+def connect(obj: SampledField, connections: Tensor) -> Mesh:
+    """
+    Build a `Mesh` by connecting elements from a field.
+
+    See Also:
+        `connect_neighbors()`.
+
+    Args:
+        obj: `PointCloud` or `Mesh`.
+        connections: Connectivity matrix. Any non-zero entry represents a connection.
+
+    Returns:
+        `Mesh`
+    """
+    if isinstance(obj, (PointCloud, Mesh)):
+        return Mesh(obj.elements, connections, obj.values, extrapolation=obj.extrapolation, bounds=obj.bounds)
+    else:
+        raise ValueError(f"connect requires a PointCloud or Mesh but got {type(obj)}")
+
+
+def connect_neighbors(obj: SampledField, max_distance: float or Tensor, format: str = 'dense') -> Mesh:
+    """
+    Build  a `Mesh` by connecting proximate elements of a `SampledField`.
+
+    See Also:
+        `connect()`.
+
+    Args:
+        obj: `PointCloud`, `Mesh`, `CenteredGrid` or `StaggeredGrid`.
+        max_distance: Connectivity threshold distance. Elements further apart than this will not be connected.
+        format: Connectivity matrix format, `'dense'`, `'coo'` or `'csr'`.
+
+    Returns:
+        `Mesh`.
+    """
+    if isinstance(obj, CenteredGrid):
+        elements = flatten(obj.elements, instance('elements'))
+        values = math.pack_dims(obj.values, spatial, instance('elements'))
+        obj = PointCloud(elements, values, obj.extrapolation, bounds=obj.bounds)
+    elif isinstance(obj, StaggeredGrid):
+        elements = flatten(obj.elements, instance('elements'), flatten_batch=True)
+        values = math.pack_dims(obj.values, spatial(obj.values).names + ('vector',), instance('elements'))
+        obj = PointCloud(elements, values, obj.extrapolation, bounds=obj.bounds)
+    assert isinstance(obj, (PointCloud, Mesh)), f"obj must be a PointCloud, Mesh or Grid but got {type(obj)}"
+    points = math.rename_dims(obj.elements, spatial, instance).center
+    dx = math.pairwise_distances(points, max_distance=max_distance, format=format)
+    con = math.vec_length(dx) > 0
+    return connect(obj, con)

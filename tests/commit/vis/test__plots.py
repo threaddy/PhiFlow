@@ -21,6 +21,18 @@ class TestPlots(TestCase):
             show(gui='matplotlib')
             show(gui='plotly')
 
+    def test_bar_chart(self):
+        dim = instance(planets='Sun,Earth,Mars')
+        data = math.random_uniform(dim, channel(variations='Mass, Size'))
+        try:
+            self._test_plot(data, err=data * .1, alpha=.2)
+        except NotImplementedError:
+            pass
+        try:
+            self._test_plot(PointCloud(math.range_tensor(dim, channel(vector='planets')), data))
+        except NotImplementedError:
+            pass
+
     def test_plot_1d(self):
         self._test_plot(CenteredGrid(lambda x: math.sin(x.vector[0]), input=100, bounds=Box(input=2 * math.pi)))
 
@@ -124,12 +136,40 @@ class TestPlots(TestCase):
     def test_plot_point_cloud_3d_points(self):
         self._test_plot(PointCloud(math.random_normal(instance(points=5), channel(vector='x,y,z'))))
 
+    def test_same_scale(self):
+        curve1 = vec(x=(0, 1, 2), y=(0, 1, 0))
+        curve2 = vec(x=(1, 1, 2), y=(-1, .5, .5))
+        try:
+            self._test_plot(curve1, curve2, same_scale='y')
+        except NotImplementedError:
+            pass
+
     def test_plot_arbitrary_lines(self):
         points = vec(resolution=wrap([0, 1, 4], spatial('line')), error=wrap([0, 1, .5], spatial('line')))
         points = stack([points, points + (0, -1)], instance('disconnected'))
         points = stack([points, points * (1, -1)], channel('categories'))
         try:
             self._test_plot(PointCloud(points), color=wrap([0, 1], channel('categories')))
+        except NotImplementedError:
+            pass
+
+    def test_plot_error_bars(self):
+        self._test_plot(vec(x=[1, 2, 3], y=[0, 2, 1]), err=vec(x=.1, y=[0, 0, .2]))
+
+    def test_plot_line_errors(self):
+        data = CenteredGrid(Noise(scale=100), x=100)
+        self._test_plot(data, color=1, alpha=1, err=data.values * .1)
+        self._test_plot(data, color=1, alpha=1, err=.2)
+
+    def test_plot_error_envelopes(self):
+        x = math.linspace(0, 3, spatial(x=100))
+        y = math.sin(x)
+        try:
+            self._test_plot(vec(x=x, y=y), err=vec(x=0, y=abs(y) * .5), color=1, alpha=.9)
+        except NotImplementedError:
+            pass
+        try:
+            self._test_plot(vec(x=y, y=x), err=vec(x=abs(y) * .5, y=0), color=1, alpha=.9)
         except NotImplementedError:
             pass
 

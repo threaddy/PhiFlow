@@ -2,6 +2,7 @@ import warnings
 from typing import Dict, Tuple, Union
 
 import numpy as np
+from phi.math import DimFilter
 
 from phi import math
 from ._geom import Geometry, _keep_vector
@@ -178,7 +179,7 @@ class Box(BaseBox, metaclass=BoxType):
         >>> Box['x,y', :1, 0:]  # creates a Box with `lower=(-inf, 0)` and `upper=(1, inf)`.
     """
 
-    def __init__(self, lower: Tensor = None, upper: Tensor = None, **size: Union[int, Tensor]):
+    def __init__(self, lower: Tensor = None, upper: Tensor = None, **size: Union[int, Tensor, tuple, list]):
         """
         Args:
           lower: physical location of lower corner
@@ -246,6 +247,12 @@ class Box(BaseBox, metaclass=BoxType):
             if dim in remaining:
                 remaining.remove(dim)
         return self.vector[remaining]
+
+    def largest(self, dim: DimFilter) -> 'Box':
+        dim = self.shape.without('vector').only(dim)
+        if not dim:
+            return self
+        return Box(math.min(self._lower, dim), math.max(self._upper, dim))
 
     def __hash__(self):
         return hash(self._upper)
@@ -397,9 +404,10 @@ class GridCell(BaseBox):
     def __init__(self, resolution: math.Shape, bounds: BaseBox):
         assert resolution.spatial_rank == resolution.rank, f"resolution must be purely spatial but got {resolution}"
         assert resolution.spatial_rank == bounds.spatial_rank, f"bounds must match dimensions of resolution but got {bounds} for resolution {resolution}"
-        self._resolution = resolution
+        assert set(bounds.vector.item_names) == set(resolution.names)
+        self._resolution = resolution.only(bounds.vector.item_names, reorder=True)
         self._bounds = bounds
-        self._shape = resolution & bounds.shape.non_spatial
+        self._shape = self._resolution & bounds.shape.non_spatial
 
     @property
     def resolution(self):

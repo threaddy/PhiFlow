@@ -1,7 +1,7 @@
 import re
 import warnings
 from numbers import Number
-from typing import Tuple, Callable, List, Union, Any
+from typing import Tuple, Callable, List, Union, Any, Sequence, Optional
 
 from phi import math
 
@@ -14,7 +14,7 @@ DUAL_DIM = 'dual'
 
 TYPE_ABBR = {SPATIAL_DIM: "ˢ", CHANNEL_DIM: "ᶜ", INSTANCE_DIM: "ⁱ", BATCH_DIM: "ᵇ", DUAL_DIM: "ᵈ", None: "⁻"}  # ᵃᵇᶜᵈᵉᶠᵍʰⁱʲᵏˡᵐⁿᵒᵖʳˢᵗᵘᵛʷˣʸᶻ
 
-DEBUG_CHECKS = False
+DEBUG_CHECKS = []
 
 
 def enable_debug_checks():
@@ -22,8 +22,7 @@ def enable_debug_checks():
     Once called, additional type checks are enabled.
     This may result in a noticeable drop in performance.
     """
-    global DEBUG_CHECKS
-    DEBUG_CHECKS = True
+    DEBUG_CHECKS.append(True)
 
 
 class Shape:
@@ -59,7 +58,7 @@ class Shape:
             `Shape.name`.
         """
         self.types: Tuple[str] = types  # undocumented, may be private
-        self.item_names: Tuple[Union[str, 'Shape']] = (None,) * len(sizes) if item_names is None else item_names  # undocumented
+        self.item_names: Tuple[Optional[Tuple[str, ...]]] = (None,) * len(sizes) if item_names is None else item_names  # undocumented
         if DEBUG_CHECKS:
             assert len(sizes) == len(names) == len(types) == len(item_names), f"sizes={sizes}, names={names}, types={types}, item_names={item_names}"
             assert len(set(names)) == len(names), f"Duplicate dimension names: {names}"
@@ -175,9 +174,9 @@ class Shape:
             Indices as `tuple[int]`.
         """
         if isinstance(dims, (list, tuple, set)):
-            return tuple([self.index(n) for n in dims])
+            return tuple([self.index(n) for n in dims if n in self.names])
         elif isinstance(dims, Shape):
-            return tuple([self.index(n) for n in dims.names])
+            return tuple([self.index(n) for n in dims.names if n in self.names])
         else:
             raise ValueError(f"indices() requires a sequence of dimensions but got {dims}")
 
@@ -241,7 +240,7 @@ class Shape:
         Returns:
             Dimension type, one of `batch`, `spatial`, `instance`, `channel`.
         """
-        return {BATCH_DIM: batch, SPATIAL_DIM: spatial, INSTANCE_DIM: instance, CHANNEL_DIM: channel}[self.get_type(dim)]
+        return DIM_FUNCTIONS[self.get_type(dim)]
 
     def get_types(self, dims: Union[tuple, list, 'Shape']) -> tuple:
         # undocumented, do not use
@@ -437,6 +436,32 @@ class Shape:
         return self[[i for i, t in enumerate(self.types) if t != DUAL_DIM]]
 
     @property
+    def primal(self) -> 'Shape':
+        """
+        Filters this shape, returning only the dual dimensions as a new `Shape` object.
+
+        See also:
+            `Shape.batch`, `Shape.spatial`, `Shape.instance`, `Shape.channel`, `Shape.dual`, `Shape.non_batch`, `Shape.non_spatial`, `Shape.non_instance`, `Shape.non_channel`, `Shape.non_dual`.
+
+        Returns:
+            New `Shape` object
+        """
+        return self[[i for i, t in enumerate(self.types) if t not in [DUAL_DIM, BATCH_DIM]]]
+
+    @property
+    def non_primal(self) -> 'Shape':
+        """
+        Filters this shape, returning only batch and dual dimensions as a new `Shape` object.
+
+        See also:
+            `Shape.batch`, `Shape.spatial`, `Shape.instance`, `Shape.channel`, `Shape.dual`, `Shape.non_batch`, `Shape.non_spatial`, `Shape.non_instance`, `Shape.non_channel`, `Shape.non_dual`.
+
+        Returns:
+            New `Shape` object
+        """
+        return self[[i for i, t in enumerate(self.types) if t in [DUAL_DIM, BATCH_DIM]]]
+
+    @property
     def non_singleton(self) -> 'Shape':
         """
         Filters this shape, returning only non-singleton dimensions as a new `Shape` object.
@@ -515,11 +540,11 @@ class Shape:
         See Also:
             `Shape.sizes`, `Shape.get_size()`.
         """
-        assert self.rank == 1, "Shape.size is only defined for shapes of rank 1."
+        assert self.rank == 1, f"Shape.size is only defined for shapes of rank 1 but has dims {self}"
         return self.sizes[0]
 
     @property
-    def type(self) -> int:
+    def type(self) -> str:
         """
         Only for Shapes containing exactly one single dimension.
         Returns the type of the dimension.
@@ -529,6 +554,12 @@ class Shape:
         """
         assert self.rank == 1, "Shape.type is only defined for shapes of rank 1."
         return self.types[0]
+
+    @property
+    def dim_type(self):
+        types = set(self.types)
+        assert len(types) == 1, f"Shape contains multiple types: {self}"
+        return DIM_FUNCTIONS[next(iter(types))]
 
     def __int__(self):
         assert self.rank == 1, "int(Shape) is only defined for shapes of rank 1."
@@ -557,12 +588,9 @@ class Shape:
     def __repr__(self):
         def size_repr(size, items):
             if items is not None:
-                if len(items) <= 4:
-                    return ",".join(items)
-                else:
-                    return f"{size}:{items[0]}..{items[-1]}"
-            else:
-                return size
+                items_str = ",".join(items)
+                return items_str if len(items_str) <= 20 else f"{size}:{items[0]}..{items[-1]}"
+            return size
 
         strings = [f"{name}{TYPE_ABBR.get(dim_type, '?')}={size_repr(size, items)}" for size, name, dim_type, items in self._dimensions]
         return '(' + ', '.join(strings) + ')'
@@ -796,7 +824,7 @@ class Shape:
         indices = [i for i, size in enumerate(self.sizes) if isinstance(size, Tensor) and size.rank > 0]
         return self[indices]
 
-    def with_size(self, size: Union[int, None]):
+    def with_size(self, size: Union[int, Tuple[str, ...]]):
         """
         Only for single-dimension shapes.
         Returns a `Shape` representing this dimension but with a different size.
@@ -813,7 +841,7 @@ class Shape:
         assert self.rank == 1, "Shape.with_size() is only defined for shapes of rank 1."
         return self.with_sizes([size])
 
-    def with_sizes(self, sizes: Union[tuple, list, 'Shape', int], keep_item_names=True):
+    def with_sizes(self, sizes: Union[Sequence[int], Sequence[Tuple[str, ...]], 'Shape', int], keep_item_names=True):
         """
         Returns a new `Shape` matching the dimension names and types of `self` but with different sizes.
 
@@ -823,8 +851,9 @@ class Shape:
         Args:
             sizes: One of
 
-                * `tuple` / `list` of same length as `self` containing replacement sizes.
+                * `tuple` / `list` of same length as `self` containing replacement sizes or replacement item names.
                 * `Shape` of any rank. Replaces sizes for dimensions shared by `sizes` and `self`.
+                * `int`: new size for all dimensions
 
             keep_item_names: If `False`, forgets all item names.
                 If `True`, keeps item names where the size does not change.
@@ -988,7 +1017,7 @@ class Shape:
         item_names[self.index(dim)] = item_name
         return Shape(self.sizes, self.names, self.types, tuple(item_names))
 
-    def _perm(self, names: Tuple[str]):
+    def _perm(self, names: Tuple[str]) -> List[int]:
         assert len(set(names)) == len(names), f"No duplicates allowed but got {names}"
         assert len(names) >= len(self.names), f"Cannot find permutation for {self} given {names} because names {set(self.names) - set(names)} are missing"
         assert len(names) <= len(self.names), f"Cannot find permutation for {self} given {names} because too many names were passed: {names}"
@@ -1026,8 +1055,9 @@ class Shape:
         sizes = list(self.sizes)
         item_names = list(self.item_names)
         for dim, (lo, up) in widths.items():
-            sizes[self.index(dim)] += lo + up
-            item_names[self.index(dim)] = None
+            if dim in self.names:
+                sizes[self.index(dim)] += lo + up
+                item_names[self.index(dim)] = None
         return Shape(tuple(sizes), self.names, self.types, tuple(item_names))
 
     def prepare_gather(self, dim: str, selection):
@@ -1300,7 +1330,7 @@ def shape(obj) -> Shape:
     Returns:
         `Shape`
     """
-    from phi.math.magic import PhiTreeNode
+    from phi.math.magic import PhiTreeNode, Shaped
     if isinstance(obj, Shape):
         return obj
     elif hasattr(obj, '__shape__'):
@@ -1313,8 +1343,10 @@ def shape(obj) -> Shape:
         return channel('vector')
     elif isinstance(obj, (Number, bool)):
         return EMPTY_SHAPE
-    elif isinstance(obj, (tuple, list)) and all(isinstance(item, PhiTreeNode) for item in obj):
+    elif isinstance(obj, (tuple, list)) and all(isinstance(item, (PhiTreeNode, Shaped)) for item in obj):
         return merge_shapes(*obj, allow_varying_sizes=True)
+    if isinstance(obj, dict) and all(isinstance(item, (PhiTreeNode, Shaped)) for item in obj):
+        return merge_shapes(*obj.values(), allow_varying_sizes=True)
     elif isinstance(obj, PhiTreeNode):
         from phi.math._magic_ops import all_attributes
         return merge_shapes(*[getattr(obj, a) for a in all_attributes(obj, assert_any=True)], allow_varying_sizes=True)
@@ -1552,6 +1584,9 @@ def dual(*args, **dims: Union[int, str, tuple, list, Shape]) -> Shape:
         raise AssertionError(f"dual() must be called either as a selector dual(Shape) or dual(Tensor) or as a constructor dual(*names, **dims). Got *args={args}, **dims={dims}")
 
 
+DIM_FUNCTIONS = {BATCH_DIM: batch, SPATIAL_DIM: spatial, INSTANCE_DIM: instance, CHANNEL_DIM: channel, DUAL_DIM: dual}
+
+
 def merge_shapes(*objs: Union[Shape, Any], order=(batch, dual, instance, spatial, channel), allow_varying_sizes=False):
     """
     Combines `shapes` into a single `Shape`, grouping dimensions by type.
@@ -1700,10 +1735,49 @@ def non_dual(obj) -> Shape:
         raise AssertionError(f"non_dual() must be called either on a Shape or an object with a 'shape' property but got {obj}")
 
 
+def non_primal(obj) -> Shape:
+    """
+    Returns the batch and dual dimensions of an object.
+
+    Args:
+        obj: `Shape` or object with a valid `shape` property.
+
+    Returns:
+        `Shape`
+    """
+    from .magic import Shaped
+    if isinstance(obj, Shape):
+        return obj.non_primal
+    elif isinstance(obj, Shaped):
+        return shape(obj).non_primal
+    else:
+        raise AssertionError(f"non_dual() must be called either on a Shape or an object with a 'shape' property but got {obj}")
+
+
+def primal(obj) -> Shape:
+    """
+    Returns the instance, spatial and channel dimensions of an object.
+
+    Args:
+        obj: `Shape` or object with a valid `shape` property.
+
+    Returns:
+        `Shape`
+    """
+    from .magic import Shaped
+    if isinstance(obj, Shape):
+        return obj.primal
+    elif isinstance(obj, Shaped):
+        return shape(obj).primal
+    else:
+        raise AssertionError(f"primal() must be called either on a Shape or an object with a 'shape' property but got {obj}")
+
 
 def _size_equal(s1, s2):
     if s1 is None:
         return s2 is None
+    if s2 is None:
+        return False
     if isinstance(s1, int):
         return isinstance(s2, int) and s2 == s1
     else:

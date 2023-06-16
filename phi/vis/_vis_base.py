@@ -8,8 +8,8 @@ from typing import Tuple, Any, Optional, Dict, Callable, Union
 from phi import field, math
 from phi.field import SampledField, Scene, PointCloud, CenteredGrid
 from phi.field._field_math import data_bounds
-from phi.geom import Box, Cuboid
-from phi.math import Shape, EMPTY_SHAPE, Tensor, spatial, instance, wrap, channel
+from phi.geom import Box, Cuboid, Geometry, Point
+from phi.math import Shape, EMPTY_SHAPE, Tensor, spatial, instance, wrap, channel, expand, non_batch
 
 Control = namedtuple('Control', [
     'name',
@@ -396,7 +396,8 @@ class Recipe:
              max_val: float,
              show_color_bar: bool,
              color: Tensor,
-             alpha: Tensor):
+             alpha: Tensor,
+             err: Tensor):
         raise NotImplementedError
 
     def __repr__(self):
@@ -414,6 +415,9 @@ def gui_interrupt(*args, **kwargs):
 def display_name(python_name: Any):
     if isinstance(python_name, (int, bool)):
         return str(python_name)
+    assert isinstance(python_name, str), f"name must be a str, int or bool but got {type(python_name)}"
+    if python_name == '_':
+        return ""
     n = list(python_name)
     n[0] = n[0].upper()
     for i in range(1, len(n)):
@@ -428,11 +432,15 @@ def display_name(python_name: Any):
         return text
 
 
-def index_label(idx: dict) -> Union[str, None]:
+def index_label(idx: dict, always_include_names: bool = False) -> Union[str, None]:
     if len(idx) == 0:
         return None
-    elif len(idx) == 1:
-        return display_name(next(iter(idx.values())))
+    if len(idx) == 1:
+        if always_include_names:
+            for name, value in idx.items():
+                return f"{display_name(name)} {display_name(value)}"
+        else:
+            return display_name(next(iter(idx.values())))
     else:
         number_unlabelled_dims = len([1 for k, v in idx.items() if isinstance(v, int)])
         if number_unlabelled_dims <= 1:
@@ -457,7 +465,7 @@ def title_label(idx: dict):
 
 
 def common_index(*indices: dict, exclude=()):
-    return {k: v for k, v in indices[0].items() if k not in exclude and all(i[k] == v for i in indices)}
+    return {k: v for k, v in indices[0].items() if k not in exclude and all([i[k] == v for i in indices])}
 
 
 def select_channel(value: Union[SampledField, Tensor, tuple, list], channel: Union[str, None]):
@@ -480,28 +488,56 @@ def select_channel(value: Union[SampledField, Tensor, tuple, list], channel: Uni
             return value
 
 
-def tensor_as_field(t: Tensor):
-    """
-    Interpret a `Tensor` as a `CenteredGrid` or `PointCloud` depending on its dimensions.
+def to_field(obj):
+    if isinstance(obj, SampledField):
+        return obj
+    if isinstance(obj, Geometry):
+        return PointCloud(obj)
+    if isinstance(obj, Tensor):
+        arbitrary_lines_1d = spatial(obj).rank == 1 and 'vector' in obj.shape
+        point_cloud = instance(obj) and 'vector' in obj.shape
+        if point_cloud or arbitrary_lines_1d:
+            return PointCloud(obj)
+        elif spatial(obj):
+            return CenteredGrid(obj, 0, bounds=Box(math.const_vec(-0.5, spatial(obj)), wrap(spatial(obj), channel('vector')) - 0.5))
+        elif 'vector' in obj.shape:
+            return PointCloud(math.expand(obj, instance(points=1)), bounds=Cuboid(obj, half_size=math.const_vec(1e-3, obj.shape['vector'])).box())
+        elif instance(obj) and not spatial(obj):
+            assert instance(obj).rank == 1, "Bar charts must have only one instance dimension"
+            vector = channel(vector=instance(obj).names)
+            equal_spacing = math.range_tensor(instance(obj), vector)
+            lower = expand(-.5, vector)
+            upper = expand(equal_spacing.max + .5, vector)
+            return PointCloud(equal_spacing, values=obj, bounds=Box(lower, upper))
+            # positions = math.layout(instance(obj).item_names, instance(obj))
+            # positions = expand(positions, vector)
+            # return PointCloud(positions, values=obj)
+    raise ValueError(f"Cannot plot {obj}. Tensors, geometries and fields can be plotted.")
 
-    Unlike the `CenteredGrid` constructor, this function will have the values sampled at integer points for each spatial dimension.
 
-    Args:
-        t: `Tensor` with either `spatial` or `instance` dimensions.
-
-    Returns:
-        `CenteredGrid` or `PointCloud`
-    """
-    arbitrary_lines_1d = spatial(t).rank == 1 and 'vector' in t.shape
-    if instance(t) or arbitrary_lines_1d or arbitrary_lines_1d:
-        bounds = data_bounds(t)
-        extended_bounds = Cuboid(bounds.center, bounds.half_size * 1.2).box()
-        lower = math.where(extended_bounds.lower * bounds.lower <= 0, bounds.lower * .9, extended_bounds.lower)
-        upper = math.where(extended_bounds.upper * bounds.upper <= 0, bounds.lower * .9, extended_bounds.upper)
-        return PointCloud(t, bounds=Box(lower, upper))
-    elif spatial(t):
-        return CenteredGrid(t, 0, bounds=Box(math.const_vec(-0.5, spatial(t)), wrap(spatial(t), channel('vector')) - 0.5))
-    elif 'vector' in t.shape:
-        return PointCloud(math.expand(t, instance(points=1)), bounds=Cuboid(t, half_size=math.const_vec(1, t.shape['vector'])).box())
+def get_default_limits(f: SampledField) -> Box:
+    if f._bounds is not None:
+        return f.bounds
+    # --- Determine element size ---
+    if (f.elements.bounding_half_extent() > 0).any:
+        size = 2 * f.elements.bounding_half_extent()
+    elif isinstance(f, PointCloud) and f.spatial_rank == 1:
+        bounds = f.bounds
+        count = non_batch(f).non_dual.non_channel.volume
+        return Box(bounds.lower - bounds.size / count / 2, bounds.upper + bounds.size / count / 2)
+    # elif instance(f) and f.spatial_rank == 1:
+    #     lower = expand(-.5, vector)
+    #     upper = expand(equal_spacing.max + .5, vector)
+    #     size =
     else:
-        raise ValueError(f"Cannot create field from tensor with shape {t.shape}. Requires at least one spatial, instance or vector dimension.")
+        size = expand(0, f.elements.shape['vector'])
+    if (size == 0).all:
+        size = math.const_vec(.1, f.elements.shape['vector'])
+    bounds = data_bounds(f.elements.center).largest(channel)
+    extended_bounds = Cuboid(bounds.center, bounds.half_size + size * 0.6)
+    extended_bounds = Box(math.min(extended_bounds.lower, size.shape.without('vector')), math.max(extended_bounds.upper, size.shape.without('vector')))
+    if isinstance(f.elements, Point):
+        lower = math.where(extended_bounds.lower * bounds.lower < 0, bounds.lower * .9, extended_bounds.lower)
+        upper = math.where(extended_bounds.upper * bounds.upper < 0, bounds.lower * .9, extended_bounds.upper)
+        extended_bounds = Box(lower, upper)
+    return extended_bounds

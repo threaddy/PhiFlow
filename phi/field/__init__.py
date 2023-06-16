@@ -46,6 +46,7 @@ from ._field_math import (
     integrate,
     pack_dims,
     support, mask,
+    connect, connect_neighbors,
 )
 from ._field_io import write, read
 from ._scene import Scene

@@ -1,6 +1,7 @@
 from unittest import TestCase
 
 import numpy as np
+import numpy.testing
 
 import phi
 from phi import math
@@ -33,6 +34,12 @@ class TestMathFunctions(TestCase):
         with math.precision(64):
             assert_not_close(math.zeros(a), math.ones(a) * 1e-100, rel_tolerance=0, abs_tolerance=0)
             assert_close(math.zeros(a), math.ones(a) * 1e-100, rel_tolerance=0, abs_tolerance=1e-15)
+
+    def test_soft_plus(self):
+        for backend in BACKENDS:
+            with backend:
+                x = math.linspace(-4, 4, spatial(samples=5))
+                math.assert_close([0.01815, 0.126928, 0.693147, 2.126928, 4.01815], math.soft_plus(x))
 
     def test_concat(self):
         c = math.concat([math.zeros(spatial(b=3, a=2)), math.ones(spatial(a=2, b=4))], spatial('b'))
@@ -470,6 +477,13 @@ class TestMathFunctions(TestCase):
         updated = math.scatter(base, indices, values, outside_handling='discard')
         assert_close(updated, math.tensor([[0, 1, 0], [0, 0, 0]], spatial('y,x')))
 
+    def test_histogram_1d(self):
+        for backend in BACKENDS:
+            with backend:
+                data = vec(instance('losses'), 0, .1, .1, .2, .1, .2, .3, .5)
+                hist, bin_edges, bin_center = math.histogram(data, instance(loss=10))
+                assert_close(hist, [1, 0, 3, 0, 2, 0, 1, 0, 0, 1])
+
     def test_sin(self):
         for backend in BACKENDS:
             with backend:
@@ -511,6 +525,22 @@ class TestMathFunctions(TestCase):
                 value = math.tensor(1.3421)
                 results.append(math.arctan(value, divide_by=0))
         assert_close(results)
+
+    def test_factorial(self):
+        for backend in BACKENDS:
+            with backend:
+                # --- int32 ---
+                value = math.to_int32(math.tensor(4))
+                math.assert_close(24, math.factorial(value))
+                self.assertEqual(DType(int, 32), math.factorial(value).dtype)
+                # --- int64 ---
+                value = math.to_int64(math.tensor(14))
+                math.assert_close(87178291200, math.factorial(value))
+                self.assertEqual(DType(int, 64), math.factorial(value).dtype)
+                # --- gamma ---
+                math.assert_close(1.791759469228055, math.log_gamma(math.tensor(4)))
+                math.assert_close(24., math.factorial(math.tensor(4.)))
+                self.assertEqual(float, math.factorial(math.tensor(4.)).dtype.kind)
 
     def test_any(self):
         for backend in BACKENDS:
@@ -620,7 +650,7 @@ class TestMathFunctions(TestCase):
         self.assertEqual((1, 12, 2), nat.shape)
         nat = math.reshaped_native(a, [batch(batch=10), a.shape.spatial, channel(vector=2)], force_expand=['x'])
         self.assertEqual((1, 12, 2), nat.shape)
-        nat = math.reshaped_native(a, [batch(batch=10), a.shape.spatial, channel(vector=2)], force_expand=True)
+        nat = math.reshaped_native(a, [batch(batch=10), a.shape.spatial, channel(vector=2)])
         self.assertEqual((10, 12, 2), nat.shape)
         nat = math.reshaped_native(a, [batch(batch=10), a.shape.spatial, channel(vector=2)], force_expand=['batch'])
         self.assertEqual((10, 12, 2), nat.shape)
@@ -631,7 +661,7 @@ class TestMathFunctions(TestCase):
         except AssertionError as err:
             print(err)
             pass
-        nat = math.reshaped_native(a, [spatial, non_spatial])
+        nat = math.reshaped_native(a, [spatial, non_spatial], force_expand=False)
         self.assertEqual((12, 2), nat.shape)
 
     def test_native(self):
@@ -759,3 +789,14 @@ class TestMathFunctions(TestCase):
         r_x, r_y = math.map(f, x, y)
         math.assert_close(wrap([(2, 4), (3, 5)], spatial('x,y')), r_x)
         math.assert_close(wrap([(-2, -4), (-1, -3)], spatial('x,y')), r_y)
+
+    def test_to_device(self):
+        for backend in BACKENDS:
+            with backend:
+                cpu = backend.list_devices('CPU')[0]
+                v = math.random_uniform()
+                self.assertEqual(cpu, math.to_device(v, 'CPU').device, msg=backend.name)
+                self.assertEqual(cpu, math.to_device(v, cpu).device, msg=backend.name)
+                for v in [1., backend.random_uniform((), 0, 1, DType(float, 32))]:
+                    math.to_device(v, 'CPU')
+                    math.to_device(v, cpu)

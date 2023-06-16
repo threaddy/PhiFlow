@@ -1,6 +1,6 @@
 import numbers
 import warnings
-from functools import wraps
+from functools import wraps, partial
 from typing import List, Callable, Tuple, Union
 from packaging import version
 
@@ -10,7 +10,6 @@ import jax.scipy as scipy
 import numpy as np
 from jax import random
 from jax.core import Tracer
-from jax.interpreters.xla import DeviceArray
 
 if version.parse(jax.__version__) >= version.parse('0.2.20'):
     from jax.experimental.sparse import BCOO, COO, CSR, CSC
@@ -45,6 +44,9 @@ class JaxBackend(Backend):
     def prefers_channels_last(self) -> bool:
         return True
 
+    def requires_fixed_shapes_when_tracing(self) -> bool:
+        return True
+
     def _check_float64(self):
         if self.precision == 64:
             if not jax.config.read('jax_enable_x64'):
@@ -76,7 +78,7 @@ class JaxBackend(Backend):
             return True
         if isinstance(x, jnp.bool_) and not isinstance(x, np.bool_):
             return True
-        if isinstance(x, (COO, BCOO, CSR, CSC)):
+        if self.is_sparse(x):
             return True
         # --- Above considered native ---
         if only_native:
@@ -92,11 +94,28 @@ class JaxBackend(Backend):
             return all([self.is_tensor(item, False) for item in x])
         return False
 
+    def is_sparse(self, x) -> bool:
+        return isinstance(x, (COO, BCOO, CSR, CSC))
+
     def is_available(self, tensor):
         return not isinstance(tensor, Tracer)
 
-    def numpy(self, x):
-        return np.array(x)
+    def numpy(self, tensor):
+        if isinstance(tensor, COO):
+            raise NotImplementedError
+        elif isinstance(tensor, BCOO):
+            indices = np.array(tensor.indices)
+            values = np.array(tensor.data)
+            indices = indices[..., 0], indices[..., 1]
+            assert values.ndim == 1, f"Cannot convert batched COO to NumPy"
+            from scipy.sparse import coo_matrix
+            return coo_matrix((values, indices), shape=self.staticshape(tensor))
+        elif isinstance(tensor, CSR):
+            raise NotImplementedError
+        elif isinstance(tensor, CSC):
+            raise NotImplementedError
+        else:
+            return np.array(tensor)
 
     def to_dlpack(self, tensor):
         from jax import dlpack
@@ -117,6 +136,7 @@ class JaxBackend(Backend):
 
     sqrt = staticmethod(jnp.sqrt)
     exp = staticmethod(jnp.exp)
+    softplus = staticmethod(jax.nn.softplus)
     sin = staticmethod(jnp.sin)
     arcsin = staticmethod(jnp.arcsin)
     cos = staticmethod(jnp.cos)
@@ -134,6 +154,8 @@ class JaxBackend(Backend):
     log2 = staticmethod(jnp.log2)
     log10 = staticmethod(jnp.log10)
     isfinite = staticmethod(jnp.isfinite)
+    isnan = staticmethod(jnp.isnan)
+    isinf = staticmethod(jnp.isinf)
     abs = staticmethod(jnp.abs)
     sign = staticmethod(jnp.sign)
     round = staticmethod(jnp.round)
@@ -161,6 +183,14 @@ class JaxBackend(Backend):
         result = jnp.nonzero(values)
         return jnp.stack(result, -1)
 
+    def vectorized_call(self, f, *args, output_dtypes=None, **aux_args):
+        batch_size = self.determine_size(args, 0)
+        args = [self.tile_to(t, 0, batch_size) for t in args]
+        def f_positional(*args):
+            return f(*args, **aux_args)
+        vec_f = jax.vmap(f_positional, 0, 0)
+        return vec_f(*args)
+
     def jit_compile(self, f: Callable) -> Callable:
         def run_jit_f(*args):
             # print(jax.make_jaxpr(f)(*args))
@@ -172,7 +202,7 @@ class JaxBackend(Backend):
         return run_jit_f
 
     def block_until_ready(self, values):
-        if isinstance(values, DeviceArray):
+        if hasattr(values, 'block_until_ready'):
             values.block_until_ready()
         if isinstance(values, (tuple, list)):
             for v in values:
@@ -298,8 +328,15 @@ class JaxBackend(Backend):
         self._check_float64()
         return jax.device_put(jnp.linspace(start, stop, number, dtype=to_numpy_dtype(self.float_type)), self._default_device.ref)
 
+    def linspace_without_last(self, start, stop, number):
+        self._check_float64()
+        return jax.device_put(jnp.linspace(start, stop, number, endpoint=False, dtype=to_numpy_dtype(self.float_type)), self._default_device.ref)
+
     def mean(self, value, axis=None, keepdims=False):
         return jnp.mean(value, axis, keepdims=keepdims)
+
+    def log_gamma(self, x):
+        return jax.lax.lgamma(self.to_float(x))
 
     def tensordot(self, a, a_axes: Union[tuple, list], b, b_axes: Union[tuple, list]):
         return jnp.tensordot(a, b, (a_axes, b_axes))
@@ -377,6 +414,20 @@ class JaxBackend(Backend):
         else:
             return jnp.array(x, to_numpy_dtype(dtype))
 
+    def unravel_index(self, flat_index, shape):
+        return jnp.stack(jnp.unravel_index(flat_index, shape), -1)
+
+    def ravel_multi_index(self, multi_index, shape, mode: Union[str, int] = 'undefined'):
+        if not self.is_available(shape):
+            return Backend.ravel_multi_index(self, multi_index, shape, mode)
+        mode = mode if isinstance(mode, int) else {'undefined': 'clip', 'periodic': 'wrap', 'clamp': 'clip'}[mode]
+        idx_first = jnp.transpose(multi_index, (self.ndims(multi_index)-1,) + tuple(range(self.ndims(multi_index)-1)))
+        result = jnp.ravel_multi_index(idx_first, shape, mode='wrap' if isinstance(mode, int) else mode)
+        if isinstance(mode, int):
+            outside = self.any((multi_index < 0) | (multi_index >= jnp.asarray(shape, dtype=multi_index.dtype)), -1)
+            result = self.where(outside, mode, result)
+        return result
+
     def gather(self, values, indices, axis: int):
         slices = [indices if i == axis else slice(None) for i in range(self.ndims(values))]
         return values[tuple(slices)]
@@ -393,15 +444,22 @@ class JaxBackend(Backend):
             results.append(b_values[b_indices])
         return jnp.stack(results)
 
-    def repeat(self, x, repeats, axis: int):
-        return jnp.repeat(x, self.as_tensor(repeats), axis)
+    def repeat(self, x, repeats, axis: int, new_length=None):
+        return jnp.repeat(x, self.as_tensor(repeats), axis, total_repeat_length=new_length)
 
     def std(self, x, axis=None, keepdims=False):
         return jnp.std(x, axis, keepdims=keepdims)
 
-    def boolean_mask(self, x, mask, axis=0):
-        slices = [mask if i == axis else slice(None) for i in range(len(x.shape))]
-        return x[tuple(slices)]
+    def boolean_mask(self, x, mask, axis=0, new_length=None, fill_value=0):
+        if new_length is None:
+            slices = [mask if i == axis else slice(None) for i in range(len(x.shape))]
+            return x[tuple(slices)]
+        else:
+            indices = jnp.argwhere(mask, size=new_length, fill_value=-1)[..., 0]
+            valid = indices >= 0
+            valid = valid[tuple([slice(None) if i == axis else None for i in range(len(x.shape))])]
+            result = self.gather(x, jnp.maximum(0, indices), axis)
+            return jnp.where(valid, result, fill_value)
 
     def any(self, boolean_tensor, axis=None, keepdims=False):
         if isinstance(boolean_tensor, (tuple, list)):
@@ -429,8 +487,26 @@ class JaxBackend(Backend):
             result.append(scatter(b_grid, b_indices, b_values, dnums))
         return jnp.stack(result)
 
+    def histogram1d(self, values, weights, bin_edges):
+        def unbatched_hist(values, weights, bin_edges):
+            hist, _ = jnp.histogram(values, bin_edges, weights=weights)
+            return hist
+        return jax.vmap(unbatched_hist)(values, weights, bin_edges)
+
+    def bincount(self, x, weights, bins: int):
+        return jnp.bincount(x, weights=weights, minlength=bins, length=bins)
+
     def quantile(self, x, quantiles):
         return jnp.quantile(x, quantiles, axis=-1)
+
+    def argsort(self, x, axis=-1):
+        return jnp.argsort(x, axis)
+
+    def searchsorted(self, sorted_sequence, search_values, side: str, dtype=DType(int, 32)):
+        if self.ndims(sorted_sequence) == 1:
+            return jnp.searchsorted(sorted_sequence, search_values, side=side).astype(to_numpy_dtype(dtype))
+        else:
+            return jax.vmap(partial(self.searchsorted, side=side, dtype=dtype))(sorted_sequence, search_values)
 
     def fft(self, x, axes: Union[tuple, list]):
         x = self.to_complex(x)

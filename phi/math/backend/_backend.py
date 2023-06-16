@@ -1,20 +1,45 @@
+import logging
 import sys
 import warnings
-from collections import namedtuple
 from contextlib import contextmanager
-from typing import List, Callable, TypeVar, Tuple, Any, Union
+from dataclasses import dataclass
+from typing import List, Callable, TypeVar, Tuple, Union, Optional
 
-import logging
 import numpy
+import numpy as np
+from numpy import ndarray
 
-from ._dtype import DType, combine_types, to_numpy_dtype
+from ._dtype import DType, combine_types
 
-
-SolveResult = namedtuple('SolveResult', [
-    'method', 'x', 'residual', 'iterations', 'function_evaluations', 'converged', 'diverged', 'message',
-])
 
 TensorType = TypeVar('TensorType')
+TensorOrArray = Union[TensorType, np.ndarray]
+
+
+@dataclass
+class SolveResult:
+    method: str
+    x: TensorType
+    residual: TensorType
+    iterations: TensorType
+    function_evaluations: TensorType
+    converged: TensorType  # (max_iter+1, batch) or (batch,)
+    diverged: TensorType  # (max_iter+1, batch) or (batch,)
+    message: List[str]  # (batch,)
+
+
+class Preconditioner:
+    def apply(self, vec):
+        raise NotImplementedError
+
+    def apply_transposed(self, vec):
+        raise NotImplementedError
+
+    def apply_inv_l(self, vec):
+        raise NotImplementedError
+
+    def apply_inv_u(self, vec):
+        raise NotImplementedError
 
 
 class ComputeDevice:
@@ -108,6 +133,9 @@ class Backend:
 
     def prefers_channels_last(self) -> bool:
         raise NotImplementedError()
+
+    def requires_fixed_shapes_when_tracing(self) -> bool:
+        return False
 
     @property
     def precision(self) -> int:
@@ -272,6 +300,13 @@ class Backend:
         """
         raise NotImplementedError()
 
+    def is_sparse(self, x) -> bool:
+        """
+        Args:
+            x: Tensor native to this `Backend`.
+        """
+        raise NotImplementedError(self)
+
     def as_tensor(self, x, convert_external=True):
         """
         Converts a tensor-like object to the native tensor representation of this backend.
@@ -315,7 +350,7 @@ class Backend:
         Use `is_available(tensor)` to check if the value can be represented as a NumPy array.
 
         Args:
-          tensor: backend-compatible tensor
+            tensor: backend-compatible tensor or sparse tensor
 
         Returns:
           NumPy representation of the values stored in the tensor
@@ -355,6 +390,36 @@ class Backend:
 
     def block_until_ready(self, values):
         pass
+
+    def vectorized_call(self, f, *args, output_dtypes=None, **aux_args):
+        """
+        Args:
+            f: Function with only positional tensor argument, returning one or multiple tensors.
+            *args: Batched inputs for `f`. The first dimension of all `args` is vectorized.
+                All tensors in `args` must have the same size or `1` in their first dimension.
+            output_dtypes: Single `DType` or tuple of DTypes declaring the dtypes of the tensors returned by `f`.
+        """
+        batch_dim = self.determine_size(args, 0)
+        result = []
+        for b in range(batch_dim):
+            result.append(f(*[t[min(b, self.staticshape(t)[0] - 1)] for t in args], **aux_args))
+        return self.stack(result)
+
+    def determine_size(self, tensors, axis):
+        sizes = [self.staticshape(t)[axis] for t in tensors]
+        non_singleton_sizes = [b for b in sizes if b != 1]
+        size = non_singleton_sizes[0] if non_singleton_sizes else 1
+        assert all([b in (1, size) for b in sizes])
+        return size
+
+    def tile_to(self, x, axis, size):
+        current_size = self.staticshape(x)[axis]
+        if current_size == size:
+            return x
+        assert size > current_size
+        assert size % current_size == 0
+        multiples = [size // current_size if i == axis else 1 for i in range(self.ndims(x))]
+        return self.tile(x, multiples)
 
     def jit_compile(self, f: Callable) -> Callable:
         return NotImplemented
@@ -513,6 +578,9 @@ class Backend:
     def linspace(self, start, stop, number):
         raise NotImplementedError(self)
 
+    def linspace_without_last(self, start, stop, number):
+        return self.linspace(start, stop, number+1)[:-1]
+
     def tensordot(self, a, a_axes: Union[tuple, list], b, b_axes: Union[tuple, list]):
         """ Multiply-sum-reduce a_axes of a with b_axes of b. """
         raise NotImplementedError(self)
@@ -602,6 +670,20 @@ class Backend:
     def exp(self, x):
         raise NotImplementedError(self)
 
+    def softplus(self, x):
+        raise NotImplementedError(self)
+
+    def log_gamma(self, x):
+        raise NotImplementedError(self)
+
+    def factorial(self, x: TensorType) -> TensorType:
+        if self.dtype(x).kind == int:
+            max_factorial = {32: 12, 64: 19}[self.dtype(x).bits]
+            factorial_list = [numpy.math.factorial(i) for i in range(max_factorial+1)]
+            return self.gather(self.cast(self.as_tensor(factorial_list), self.dtype(x)), x, 0)
+        else:
+            return self.exp(self.log_gamma(self.to_float(x) + 1))
+
     def conv(self, value, kernel, zero_padding=True):
         """
         Convolve value with kernel.
@@ -686,6 +768,40 @@ class Backend:
     def to_complex(self, x):
         return self.cast(x, DType(complex, max(64, self.precision * 2)))
 
+    def unravel_index(self, flat_index, shape):
+        strides = [1]
+        for size in reversed(shape[1:]):
+            strides.append(strides[-1] * size)
+        strides = strides[::-1]
+        result = []
+        for i in range(len(shape)):
+            result.append(flat_index // strides[i] % shape[i])
+        return self.stack(result, -1)
+
+    def ravel_multi_index(self, multi_index, shape, mode: Union[str, int] = 'undefined'):
+        """
+        Args:
+            multi_index: (batch..., index_dim)
+            shape: 1D tensor or tuple/list
+            mode: `'undefined'`, `'periodic'`, `'clamp'` or an `int` to use for all invalid indices.
+
+        Returns:
+            Integer tensor of shape (batch...)
+        """
+        strides = [self.ones((), self.dtype(multi_index))]
+        for size in reversed(shape[1:]):
+            strides.append(strides[-1] * size)
+        strides = self.stack(strides[::-1])
+        if mode == 'periodic':
+            multi_index %= self.as_tensor(shape)
+        elif mode == 'clamp':
+            multi_index = self.clip(multi_index, 0, self.as_tensor(shape) - 1)
+        result = self.sum(multi_index * strides, -1)
+        if isinstance(mode, int):
+            inside = self.all((0 <= multi_index) & (multi_index < self.as_tensor(shape)), -1)
+            result = self.where(inside, result, mode)
+        return result
+
     def gather(self, values, indices, axis: int):
         """
         Gathers values from the tensor `values` at locations `indices`.
@@ -699,6 +815,9 @@ class Backend:
             tensor, with size along `axis` being the length of `indices`
         """
         raise NotImplementedError(self)
+
+    def gather_by_component_indices(self, values, *component_indices):
+        return values[component_indices]
 
     def batched_gather_nd(self, values, indices):
         """
@@ -714,22 +833,36 @@ class Backend:
         """
         raise NotImplementedError(self)
 
+    def batched_gather_1d(self, values, indices):
+        return self.batched_gather_nd(values[:, :, None], indices[:, :, None])[..., 0]
+
+    def gather_1d(self, values, indices):
+        return self.gather(values, indices, 0)
+
     def flatten(self, x):
         return self.reshape(x, (-1,))
 
     def std(self, x, axis=None, keepdims=False):
         raise NotImplementedError(self)
 
-    def boolean_mask(self, x, mask, axis=0):
+    def boolean_mask(self, x, mask, axis=0, new_length=None, fill_value=0):
         """
         Args:
             x: tensor with any number of dimensions
             mask: 1D mask tensor
             axis: Axis index >= 0
+            new_length: Maximum size of the output along `axis`. This must be set when jit-compiling with Jax.
+            fill_value: If `new_length` is larger than the filtered result, the remaining values will be set to `fill_value`.
         """
         raise NotImplementedError(self)
 
     def isfinite(self, x):
+        raise NotImplementedError(self)
+
+    def isnan(self, x):
+        raise NotImplementedError(self)
+
+    def isinf(self, x):
         raise NotImplementedError(self)
 
     def scatter(self, base_grid, indices, values, mode: str):
@@ -746,6 +879,27 @@ class Backend:
             Copy of base_grid with values at `indices` updated by `values`.
         """
         raise NotImplementedError(self)
+
+    def histogram1d(self, values, weights, bin_edges):
+        """
+        Args:
+            values: (batch, values)
+            bin_edges: (batch, edges)
+            weights: (batch, values)
+
+        Returns:
+            (batch, edges) with dtype matching weights
+        """
+        raise NotImplementedError(self)
+
+    def bincount(self, x, weights: Optional[TensorType], bins: int):
+        raise NotImplementedError(self)
+
+    def batched_bincount(self, x, weights: Optional[TensorType], bins: int):
+        if weights is None:
+            return self.vectorized_call(self.bincount, x, weights=None, bins=bins)
+        else:
+            return self.vectorized_call(self.bincount, x, weights, bins=bins)
 
     def any(self, boolean_tensor, axis=None, keepdims=False):
         raise NotImplementedError(self)
@@ -764,6 +918,12 @@ class Backend:
         Returns:
             Tensor with shape (quantiles, *x.shape[:-1])
         """
+        raise NotImplementedError(self)
+
+    def argsort(self, x, axis=-1):
+        raise NotImplementedError(self)
+
+    def searchsorted(self, sorted_sequence, search_values, side: str, dtype=DType(int, 32)):
         raise NotImplementedError(self)
 
     def fft(self, x, axes: Union[tuple, list]):
@@ -870,7 +1030,7 @@ class Backend:
         """
         raise NotImplementedError(self)
 
-    def repeat(self, x, repeats, axis: int):
+    def repeat(self, x, repeats, axis: int, new_length=None):
         """
         Repeats the elements along `axis` `repeats` times.
 
@@ -878,6 +1038,7 @@ class Backend:
             x: Tensor
             repeats: How often to repeat each element. 1D tensor of length x.shape[axis]
             axis: Which axis to repeat elements along
+            new_length: Set the length of `axis` after repeating. This is required for jit compilation with Jax.
 
         Returns:
             repeated Tensor
@@ -967,19 +1128,7 @@ class Backend:
         result = self.scatter(base, indices, values, mode='add' if contains_duplicates else 'update')
         return result
 
-    def ilu_coo(self, indices, values, shape, iterations: int, safe: bool):
-        """ See incomplete_lu_coo() in _linalg """
-        from ._linalg import incomplete_lu_coo
-        assert self.dtype(values).kind in (bool, int, float)
-        return incomplete_lu_coo(self, indices, self.to_float(values), shape, iterations, safe)
-
-    def ilu_dense(self, matrix, iterations: int, safe: bool):
-        """ See incomplete_lu_dense() in _linalg """
-        from ._linalg import incomplete_lu_dense
-        assert self.dtype(matrix).kind in (bool, int, float)
-        return incomplete_lu_dense(self, self.to_float(matrix), iterations, safe)
-
-    def csr_matrix(self, column_indices, row_pointers, values, shape: Tuple[int, int]):
+    def csr_matrix(self, column_indices: TensorOrArray, row_pointers: TensorOrArray, values: TensorOrArray, shape: Tuple[int, int]):
         """
         Create a sparse matrix in compressed sparse row (CSR) format.
 
@@ -1093,40 +1242,6 @@ class Backend:
         """
         raise NotImplementedError(self)
 
-    def pairwise_distances(self, positions, max_radius, format: str, index_dtype=DType(int, 32)) -> list:
-        """
-
-        Args:
-            positions: Point locations of shape (batch, instances, vector)
-            max_radius: Scalar or (batch,) or (batch, instances)
-            format: 'csr',  Not yet implemented: 'sparse', 'coo', 'csc'
-            index_dtype: Either int32 or int64
-
-        Returns:
-            Sequence of batch_size sparse distance matrices
-        """
-        from sklearn import neighbors
-        batch_size, point_count, _vec_count = self.staticshape(positions)
-        positions_np_batched = self.numpy(positions)
-        result = []
-        for i in range(batch_size):
-            tree = neighbors.KDTree(positions_np_batched[i])
-            radius = float(max_radius) if len(self.staticshape(max_radius)) == 0 else max_radius[i]
-            nested_neighbors = tree.query_radius(positions_np_batched[i], r=radius)  # ndarray[ndarray]
-            if format == 'csr':
-                column_indices = numpy.concatenate(nested_neighbors).astype(to_numpy_dtype(index_dtype))  # flattened_neighbors
-                neighbor_counts = [len(nlist) for nlist in nested_neighbors]
-                row_pointers = numpy.concatenate([[0], numpy.cumsum(neighbor_counts)]).astype(to_numpy_dtype(index_dtype))
-                pos_neighbors = self.gather(positions[i], column_indices, 0)
-                pos_self = self.repeat(positions[i], neighbor_counts, axis=0)
-                values = pos_neighbors - pos_self
-                result.append((column_indices, row_pointers, values))
-                # sparse_matrix = self.csr_matrix(column_indices, row_pointers, values, (point_count, point_count))
-                # sparse_matrix.eliminate_zeros()  # setdiag(0) keeps zero entries
-            else:
-                raise NotImplementedError(format)
-        return result
-
     def minimize(self, method: str, f, x0, atol, max_iter, trj: bool):
         if method == 'auto':
             method = 'L-BFGS-B'
@@ -1137,56 +1252,82 @@ class Backend:
             from ._minimize import scipy_minimize
             return scipy_minimize(self, method, f, x0, atol, max_iter, trj)
 
-    def linear_solve(self, method: str, lin, y, x0, tol_sq, max_iter) -> SolveResult:
+    def linear_solve(self,
+                     method: str,
+                     lin: Union[Callable, TensorType],
+                     y: TensorType,
+                     x0: TensorType,
+                     rtol: Union[ndarray, TensorType],
+                     atol: Union[ndarray, TensorType],
+                     max_iter: ndarray,
+                     pre: Optional[Preconditioner]) -> SolveResult:
         """
         Solve the system of linear equations A · x = y.
         This method need not provide a gradient for the operation.
 
         Args:
-            method: Which algorithm to use. One of `('auto', 'CG', 'CG-adaptive')`.
+            method: Which algorithm to use. One of:
+                * 'auto'
+                * 'CG'
+                * 'CG-adaptive'
+                * 'biCG-stab' or 'biCG-stab(1)'
+                * 'biCG-stab(n)'
+                * 'scipy-direct'
+                * 'scipy-CG', 'scipy-GMres', 'scipy-biCG', 'scipy-biCG-stab', 'scipy-CGS', 'scipy-QMR', 'scipy-GCrotMK'
             lin: Linear operation. One of
                 * sparse/dense matrix valid for all instances
                 * tuple/list of sparse/dense matrices for varying matrices along batch, must have the same nonzero locations.
                 * linear function A(x), must be called on all instances in parallel
             y: target result of A * x. 2nd order tensor (batch, vector) or list of vectors.
             x0: Initial guess of size (batch, parameters)
-            tol_sq: Squared absolute tolerance of size (batch,)
-            max_iter: Maximum number of iterations of size (batch,) or a sequence of maximum iterations to obtain a trajectory.
+            rtol: Relative tolerance of size (batch,)
+            atol: Absolute tolerance of size (batch,)
+            max_iter: Maximum number of iterations of shape (checkpoints, batch).
+            pre: Preconditioner, function taking one native tensor like `y` as input and returning a native tensor like `x0`.
 
         Returns:
             `SolveResult`
         """
         if method == 'auto':
-            return self.conjugate_gradient_adaptive(lin, y, x0, tol_sq, max_iter)
+            return self.conjugate_gradient_adaptive(lin, y, x0, rtol, atol, max_iter, pre)
+        elif method.startswith('scipy-'):
+            from ._linalg import scipy_spsolve
+            if not callable(lin):
+                lin = self.numpy(lin)
+            y = self.numpy(y)
+            x0 = self.numpy(x0)
+            rtol = self.numpy(rtol) if self.is_tensor(rtol, only_native=True) else rtol
+            atol = self.numpy(atol) if self.is_tensor(atol, only_native=True) else atol
+            result = scipy_spsolve(self, method[len('scipy-'):], lin, y, x0, rtol, atol, max_iter, pre)
+            return SolveResult(result.method, self.as_tensor(result.x), self.as_tensor(result.residual), result.iterations, result.function_evaluations, result.converged, result.diverged, result.message)
         elif method == 'CG':
-            return self.conjugate_gradient(lin, y, x0, tol_sq, max_iter)
+            return self.conjugate_gradient(lin, y, x0, rtol, atol, max_iter, pre)
         elif method == 'CG-adaptive':
-            return self.conjugate_gradient_adaptive(lin, y, x0, tol_sq, max_iter)
+            return self.conjugate_gradient_adaptive(lin, y, x0, rtol, atol, max_iter, pre)
         elif method in ['biCG', 'biCG-stab(0)']:
-            raise NotImplementedError("Unstabilized Bi-CG not yet supported")
-            # return self.bi_conjugate_gradient_original(lin, y, x0, tol_sq, max_iter)
+            return self.bi_conjugate_gradient(lin, y, x0, rtol, atol, max_iter, pre, poly_order=0)
         elif method == 'biCG-stab':
-            return self.bi_conjugate_gradient(lin, y, x0, tol_sq, max_iter, poly_order=1)
+            return self.bi_conjugate_gradient(lin, y, x0, rtol, atol, max_iter, pre, poly_order=1)
         elif method.startswith('biCG-stab('):
             order = int(method[len('biCG-stab('):-1])
-            return self.bi_conjugate_gradient(lin, y, x0, tol_sq, max_iter, poly_order=order)
+            return self.bi_conjugate_gradient(lin, y, x0, rtol, atol, max_iter, pre, poly_order=order)
         else:
             raise NotImplementedError(f"Method '{method}' not supported for linear solve.")
 
-    def conjugate_gradient(self, lin, y, x0, tol_sq, max_iter) -> SolveResult:
+    def conjugate_gradient(self, lin, y, x0, rtol, atol, max_iter, pre) -> SolveResult:
         """ Standard conjugate gradient algorithm. Signature matches to `Backend.linear_solve()`. """
-        from ._linalg import cg, stop_on_l2
-        return cg(self, lin, y, x0, stop_on_l2(self, tol_sq, max_iter), max_iter)
+        from ._linalg import cg
+        return cg(self, lin, y, x0, rtol, atol, max_iter, pre)
 
-    def conjugate_gradient_adaptive(self, lin, y, x0, tol_sq, max_iter) -> SolveResult:
+    def conjugate_gradient_adaptive(self, lin, y, x0, rtol, atol, max_iter, pre) -> SolveResult:
         """ Conjugate gradient algorithm with adaptive step size. Signature matches to `Backend.linear_solve()`. """
-        from ._linalg import cg_adaptive, stop_on_l2
-        return cg_adaptive(self, lin, y, x0, stop_on_l2(self, tol_sq, max_iter), max_iter)
+        from ._linalg import cg_adaptive
+        return cg_adaptive(self, lin, y, x0, rtol, atol, max_iter, pre)
 
-    def bi_conjugate_gradient(self, lin, y, x0, tol_sq, max_iter, poly_order=2) -> SolveResult:
+    def bi_conjugate_gradient(self, lin, y, x0, rtol, atol, max_iter, pre, poly_order=2) -> SolveResult:
         """ Generalized stabilized biconjugate gradient algorithm. Signature matches to `Backend.linear_solve()`. """
-        from ._linalg import bicg, stop_on_l2
-        return bicg(self, lin, y, x0, stop_on_l2(self, tol_sq, max_iter), max_iter, poly_order)
+        from ._linalg import bicg
+        return bicg(self, lin, y, x0, rtol, atol, max_iter, pre, poly_order)
 
     def linear(self, lin, vector):
         if callable(lin):
@@ -1215,9 +1356,15 @@ class Backend:
         """
         raise NotImplementedError(self)
 
+    def solve_triangular(self, matrix, rhs, lower: bool, unit_diagonal: bool):
+        """Performs a sparse or dense triangular solve, depending on the format of `matrix`."""
+        if self.is_sparse(matrix):
+            return self.solve_triangular_sparse(matrix, rhs, lower, unit_diagonal)
+        else:
+            return self.solve_triangular_dense(matrix, rhs, lower, unit_diagonal)
+
     def solve_triangular_dense(self, matrix, rhs, lower: bool, unit_diagonal: bool):
         """
-
         Args:
             matrix: (batch_size, rows, cols)
             rhs: (batch_size, cols)
@@ -1228,6 +1375,13 @@ class Backend:
             (batch_size, cols)
         """
         raise NotImplementedError(self)
+
+    def solve_triangular_sparse(self, matrix, rhs, lower: bool, unit_diagonal: bool):
+        np_matrix = self.numpy(matrix)
+        np_rhs = self.numpy(rhs)
+        from scipy.sparse.linalg import spsolve_triangular
+        np_result = spsolve_triangular(np_matrix, np_rhs.T, lower=lower, unit_diagonal=unit_diagonal).T
+        return self.as_tensor(np_result)
 
     def stop_gradient(self, value):
         raise NotImplementedError(self)

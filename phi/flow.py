@@ -19,13 +19,18 @@ from .physics import fluid, advect, diffuse
 
 # Classes
 from .math import Shape, Tensor, DType, Solve
+<<<<<<< HEAD
 from .geom import Geometry, Sphere, Box, Cuboid, AdapterPolygon, infinite_polygon
 from .field import Grid, CenteredGrid, StaggeredGrid, mask, Noise, PointCloud, Scene, resample, GeometryMask, SoftGeometryMask, HardGeometryMask
+=======
+from .geom import Geometry, Sphere, Box, Cuboid
+from .field import Field, Grid, CenteredGrid, StaggeredGrid, mask, Noise, PointCloud, Scene, resample, GeometryMask, SoftGeometryMask, HardGeometryMask
+>>>>>>> 1c14b08485c7dcf9f76a62277a50c1fd2b09802d
 from .vis import Viewer
 from .physics.fluid import Obstacle
 
 # Constants
-from .math import PI, INF, NAN
+from .math import PI, INF, NAN, f
 from .math.extrapolation import PERIODIC, ZERO_GRADIENT
 
 # Functions

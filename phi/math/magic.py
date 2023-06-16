@@ -76,9 +76,13 @@ class Shaped(metaclass=_ShapedType):
 
 class _SliceableType(type):
     def __instancecheck__(self, instance):
+        if isinstance(instance, str):
+            return False
         return isinstance(instance, Shaped) and hasattr(instance, '__getitem__')
 
     def __subclasscheck__(self, subclass):
+        if subclass == str:
+            return False
         return hasattr(subclass, '__getitem__')
 
 
@@ -314,7 +318,7 @@ class _PhiTreeNodeType(type):
         elif isinstance(instance, Dict):
             return True
         elif isinstance(instance, dict):
-            return all(isinstance(name, str) for name in instance.keys()) and all(isinstance(val, PhiTreeNode) for val in instance.values())
+            return all(isinstance(name, str) for name in instance.keys()) and all(isinstance(val, (Shaped, PhiTreeNode)) for val in instance.values())
         elif dataclasses.is_dataclass(instance):
             return True
         else:
@@ -522,6 +526,20 @@ class BoundDim:
     def __getattr__(self, item):
         return _BoundDims(self.obj, (self.name, item))
 
+    def keys(self):
+        """
+        Allows unstacking with item names as `dict(**obj.dim)`.
+
+        Returns:
+            Sequence of item names or indices.
+        """
+        if not self.exists:
+            raise SyntaxError(f"Cannot get keys of nonexistent dimension {self}")
+        if self.item_names is not None:
+            return self.item_names
+        else:
+            return range(self.size)
+
     def unstack(self, size: Union[int, None] = None) -> tuple:
         """
         Lists the slices along this dimension as a `tuple`.
@@ -617,6 +635,9 @@ class BoundDim:
         from ._magic_ops import unpack_dim
         return unpack_dim(self.obj, self.name, *dims, **kwargs)
 
+    def __bool__(self):
+        raise SyntaxError(f"{self} cannot be converted to bool. The property you want to access likely does not exist.")
+
 
 class _BoundDims:
 
@@ -662,6 +683,13 @@ class _BoundDims:
         """ Iterate over slices along this dim """
         return iter(self.unstack())
 
+    def __call__(self, *args, **kwargs):
+        raise TypeError(f"Method {type(self.obj).__name__}.{self.name}() does not exist.")
+
+    def __repr__(self):
+        parts = [type(self.obj).__name__, *self.dims]
+        return ".".join(parts)
+
     def retype(self, dim_type: Callable, **kwargs):
         """
         Returns a shallow copy of the `Tensor` where this dimension has the specified type.
@@ -693,6 +721,9 @@ class _BoundDims:
     def as_dual(self):
         """ Returns a shallow copy of the `Tensor` where the type of this dimension is *instance*. """
         return self.retype(dual)
+
+    def __bool__(self):
+        raise SyntaxError(f"{self} cannot be converted to bool. The property you want to access likely does not exist.")
 
 
 def slicing_dict(obj, item) -> dict:
@@ -729,7 +760,9 @@ def slicing_dict(obj, item) -> dict:
         elif non_batch(obj).rank == 1:
             return {non_batch(obj).name: item}
         else:
-            raise AssertionError(f"Slicing {type(obj).__name__}[{type(item).__name__}] is only supported for 1D values (excluding batch dimensions) but shape is {shape(obj)}")
+            from ._tensors import Tensor
+            class_name = "Tensor" if isinstance(obj, Tensor) else type(obj).__name__
+            raise AssertionError(f"Slicing {class_name}[{type(item).__name__}] is only supported for 1D values (excluding batch dimensions) but shape is {shape(obj)}")
 
 
 class OtherMagicFunctions:

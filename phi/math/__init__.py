@@ -19,21 +19,27 @@ from .backend import NUMPY, precision, set_global_precision, get_precision
 from ._shape import (
     shape, Shape, EMPTY_SHAPE, DimFilter,
     spatial, channel, batch, instance, dual,
-    non_batch, non_spatial, non_instance, non_channel, non_dual,
+    non_batch, non_spatial, non_instance, non_channel, non_dual, non_primal, primal,
     merge_shapes, concat_shapes, IncompatibleShapes,
     enable_debug_checks,
 )
 
-from ._magic_ops import slice_ as slice, unstack, stack, concat, expand, rename_dims, pack_dims, unpack_dim, flatten, copy_with, replace
+from ._magic_ops import (
+    slice_ as slice, unstack,
+    stack, concat, expand,
+    rename_dims, rename_dims as replace_dims, pack_dims, unpack_dim, flatten,
+    b2i, c2b, i2b, s2b, si2d,
+    copy_with, replace
+)
 
-from ._tensors import wrap, tensor, layout, Tensor, Dict, to_dict, from_dict, is_scalar
+from ._tensors import wrap, tensor, layout, Tensor, Dict, to_dict, from_dict, is_scalar, BROADCAST_FORMATTER as f
 
-from ._sparse import dense, get_sparsity, factor_ilu
+from ._sparse import dense, get_sparsity, get_format, sparse_tensor, stored_indices, stored_values, tensor_like
 
 from .extrapolation import Extrapolation
 
 from ._ops import (
-    choose_backend_t as choose_backend, all_available, convert, seed,
+    choose_backend_t as choose_backend, all_available, convert, seed, to_device,
     native, numpy, reshaped_native, reshaped_tensor, reshaped_numpy, copy, native_call,
     print_ as print,
     map_ as map,
@@ -41,39 +47,27 @@ from ._ops import (
     zeros_like, ones_like,
     pad,
     transpose,  # reshape operations
-    divide_no_nan,
+    safe_div, safe_div as divide_no_nan,
     where, nonzero,
     sum_ as sum, finite_sum, mean, finite_mean, std, prod, max_ as max, finite_max, min_ as min, finite_min, any_ as any, all_ as all, quantile, median,  # reduce
     dot,
     abs_ as abs, sign,
     round_ as round, ceil, floor,
     maximum, minimum, clip,
-    sqrt, exp, log, log2, log10, sigmoid,
-    sin, cos, tan, sinh, cosh, tanh, arcsin, arccos, arctan, arcsinh, arccosh, arctanh,
+    sqrt, exp, log, log2, log10, sigmoid, soft_plus,
+    sin, cos, tan, sinh, cosh, tanh, arcsin, arccos, arctan, arcsinh, arccosh, arctanh, log_gamma, factorial,
     to_float, to_int32, to_int64, to_complex, imag, real, conjugate,
     degrees,
     boolean_mask,
-    is_finite, is_finite as isfinite,
+    is_finite, is_finite as isfinite, is_nan, is_inf,
     closest_grid_values, grid_sample, scatter, gather,
+    histogram,
     fft, ifft, convolve, cumulative_sum,
     dtype, cast,
     close, assert_close,
     stop_gradient,
-    pairwise_distances,
+    pairwise_distances, map_pairs,
 )
-
-from ._trace import matrix_from_function
-
-from ._functional import (
-    LinearFunction, jit_compile_linear, jit_compile,
-    jacobian, jacobian as gradient, functional_gradient, custom_gradient, print_gradient,
-    map_types, map_s2b, map_i2b,
-    iterate,
-    identity,
-    trace_check,
-)
-
-from ._optimize import solve_linear, solve_nonlinear, minimize, Solve, SolveInfo, ConvergenceException, NotConverged, Diverged, SolveTape
 
 from ._nd import (
     shift,
@@ -85,6 +79,20 @@ from ._nd import (
     downsample2x, upsample2x, sample_subgrid,
     masked_fill, finite_fill
 )
+
+from ._trace import matrix_from_function
+
+from ._functional import (
+    LinearFunction, jit_compile_linear, jit_compile,
+    jacobian, jacobian as gradient, functional_gradient, custom_gradient, print_gradient,
+    map_types, map_s2b, map_i2b, map_c2b,
+    broadcast,
+    iterate,
+    identity,
+    trace_check,
+)
+
+from ._optimize import solve_linear, solve_nonlinear, minimize, Solve, SolveInfo, ConvergenceException, NotConverged, Diverged, SolveTape, factor_ilu
 
 PI = 3.14159265358979323846
 """Value of π to double precision """
@@ -101,6 +109,17 @@ nan = NAN  # intentionally undocumented, use NAN instead. Exists only as an anlo
 
 NUMPY = NUMPY  # to show up in pdoc
 """Default backend for NumPy arrays and SciPy objects."""
+
+f = f
+"""
+Automatic mapper for broadcast string formatting of tensors, resulting in tensors of strings.
+Used with the special `-f-` syntax.
+
+Examples:
+    >>> from phi.math import f
+    >>> -f-f'String containing {tensor1} and {tensor2:.1f}'
+    # Result is a str tensor containing all dims of tensor1 and tensor2
+"""
 
 __all__ = [key for key in globals().keys() if not key.startswith('_')]
 

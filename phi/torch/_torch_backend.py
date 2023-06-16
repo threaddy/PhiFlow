@@ -44,6 +44,9 @@ class TorchBackend(Backend):
             return True  # this is pretty much required, else we couldn't perform NP+PyTorch operations
         return False
 
+    def is_sparse(self, x) -> bool:
+        return x.is_sparse
+
     def as_tensor(self, x, convert_external=True):
         if isinstance(x, torch.nn.Module):
             return x
@@ -92,12 +95,31 @@ class TorchBackend(Backend):
         # return True
         return torch._C._get_tracing_state() is None  # TODO can we find out whether this tensor specifically is being traced?
 
-    def numpy(self, tensor):
+    def numpy(self, tensor, coalesce=False):
         if tensor.requires_grad:
             tensor = tensor.detach()
         if hasattr(tensor, 'resolve_conj'):
             tensor = tensor.resolve_conj()
-        return tensor.cpu().numpy()
+        if tensor.is_sparse:
+            if coalesce:
+                tensor = tensor.coalesce()
+                indices = tensor.indices()
+                values = tensor.values()
+            else:
+                indices = tensor._indices()
+                values = tensor._values()
+            indices = self.numpy(indices)
+            values = self.numpy(values)
+            from scipy.sparse import coo_matrix
+            return coo_matrix((values, indices), shape=self.staticshape(tensor))
+        elif tensor.is_sparse_csr:
+            values = self.numpy(tensor.values())
+            indices = self.numpy(tensor.col_indices())
+            pointers = self.numpy(tensor.crow_indices())
+            from scipy.sparse import csr_matrix
+            return csr_matrix((values, indices, pointers), shape=self.staticshape(tensor))
+        else:
+            return tensor.cpu().numpy()
 
     def to_dlpack(self, tensor):
         from torch.utils import dlpack
@@ -144,6 +166,8 @@ class TorchBackend(Backend):
     log10 = torch.log10
     sigmoid = torch.sigmoid
     isfinite = torch.isfinite
+    isnan = torch.isnan
+    isinf = torch.isinf
     abs = torch.abs
     sign = torch.sign
     round = torch.round
@@ -152,10 +176,22 @@ class TorchBackend(Backend):
     nonzero = torch.nonzero
     flip = torch.flip
     seed = staticmethod(torch.manual_seed)
+    log_gamma = torch.lgamma
+
+    def softplus(self, x):
+        return torch.nn.Softplus()(x)
 
     def einsum(self, equation, *tensors):
         tensors = self.auto_cast(*tensors, bool_to_int=True, int_to_float=True)
         return torch.einsum(equation, *tensors)
+
+    def vectorized_call(self, f, *args, output_dtypes=None, **aux_args):
+        if not hasattr(torch, 'vmap'):
+            return Backend.vectorized_call(self, f, *args, output_dtypes=output_dtypes, **aux_args)
+        batch_size = self.determine_size(args, 0)
+        args = [self.tile_to(t, 0, batch_size) for t in args]
+        f_vec = torch.vmap(f, 0, 0)
+        return f_vec(*args, **aux_args)
 
     def jit_compile(self, f: Callable) -> Callable:
         return JITFunction(self, f)
@@ -302,6 +338,10 @@ class TorchBackend(Backend):
         return torch.sum(value, dim=axis, keepdim=keepdims)
 
     def prod(self, value, axis=None):
+        if not self.is_tensor(value, only_native=True):
+            return NUMPY.prod(value, axis)
+        if axis is None:
+            axis = tuple(range(len(value.shape)))
         if isinstance(axis, (tuple, list)):
             for dim in reversed(sorted(axis)):
                 value = torch.prod(value, dim=dim)
@@ -336,6 +376,13 @@ class TorchBackend(Backend):
         x = self.to_float(x)
         result = torch.quantile(x, quantiles, dim=-1)
         return result
+    
+    def argsort(self, x, axis=-1):
+        return torch.argsort(x, axis)
+
+    def searchsorted(self, sorted_sequence, search_values, side: str, dtype=DType(int, 32)):
+        int32 = {32: True, 64: False}[dtype.bits]
+        return torch.searchsorted(sorted_sequence, search_values, right=side == 'right', side=side, out_int32=int32)
 
     def divide_no_nan(self, x, y):
         x, y = self.auto_cast(x, y)
@@ -356,7 +403,7 @@ class TorchBackend(Backend):
     def range(self, start, limit=None, delta=1, dtype: DType = DType(int, 32)):
         if limit is None:
             start, limit = 0, start
-        return torch.arange(start, limit, delta, dtype=to_torch_dtype(dtype))
+        return torch.arange(start, limit, delta, dtype=to_torch_dtype(dtype), device=self.get_default_device().ref)
 
     def zeros(self, shape, dtype=None):
         return torch.zeros(shape, dtype=to_torch_dtype(dtype or self.float_type), device=self.get_default_device().ref)
@@ -383,7 +430,7 @@ class TorchBackend(Backend):
             unit = torch.linspace(0, 1, number, dtype=to_torch_dtype(self.float_type), device=self.get_default_device().ref)
             return unit * (stop - start) + start
         else:
-            return torch.linspace(start, stop, number, dtype=to_torch_dtype(self.float_type), device=self.get_default_device().ref)
+            return torch.linspace(float(start), float(stop), number, dtype=to_torch_dtype(self.float_type), device=self.get_default_device().ref)
 
     def tensordot(self, a, a_axes: Union[tuple, list], b, b_axes: Union[tuple, list]):
         a, b = self.auto_cast(a, b)
@@ -528,8 +575,13 @@ class TorchBackend(Backend):
             return NUMPY.staticshape(tensor)
 
     def gather(self, values, indices, axis: int):
+        indices = self.to_int64(indices)
         slices = [indices if i == axis else slice(None) for i in range(self.ndims(values))]
         return values[tuple(slices)]
+
+    def gather_by_component_indices(self, values, *component_indices):
+        component_indices = [self.to_int64(c) for c in component_indices]
+        return values[tuple(component_indices)]
 
     def batched_gather_nd(self, values, indices):
         values = self.as_tensor(values)
@@ -552,7 +604,7 @@ class TorchBackend(Backend):
             x = self.to_float(x)
         return torch.std(x, dim=axis, keepdim=keepdims, unbiased=False)
 
-    def boolean_mask(self, x, mask, axis=0):
+    def boolean_mask(self, x, mask, axis=0, new_length=None, fill_value=0):
         x = self.as_tensor(x)
         mask = self.as_tensor(mask)
         result = []
@@ -582,6 +634,20 @@ class TorchBackend(Backend):
         indices = indices.long().repeat([1, 1, values.shape[-1]])
         result = scatter(base_grid_flat, dim=1, index=indices, src=values)
         return torch.reshape(result, base_grid.shape)
+
+    def histogram1d(self, values, weights, bin_edges):
+        values = self.as_tensor(values)
+        weights = self.as_tensor(weights)
+        bin_edges = self.as_tensor(bin_edges)
+        bin_count = self.staticshape(bin_edges)[-1] - 1
+        batch_size, _ = self.staticshape(values)
+        bin_indices = torch.minimum(torch.searchsorted(bin_edges, values, side='right') - 1, self.as_tensor(bin_count - 1))  # ToDo this includes values outside
+        result = torch.zeros(batch_size, bin_count, dtype=weights.dtype, device=values.device)
+        hist = torch.scatter_add(result, -1, bin_indices, weights)
+        return hist
+
+    def bincount(self, x, weights, bins: int):
+        return torch.bincount(x, weights, minlength=bins)
 
     def arctan2(self, y, x):
         y, x = self.auto_cast(y, x)
@@ -641,7 +707,7 @@ class TorchBackend(Backend):
             multiples = multiples.tolist()
         return self.as_tensor(value).repeat(multiples)
 
-    def repeat(self, x, repeats, axis: int):
+    def repeat(self, x, repeats, axis: int, new_length=None):
         if isinstance(repeats, (np.ndarray, tuple, list)):
             repeats = self.as_tensor(repeats)
         return torch.repeat_interleave(self.as_tensor(x), repeats, axis)
@@ -661,6 +727,7 @@ class TorchBackend(Backend):
     def csr_matrix(self, column_indices, row_pointers, values, shape: Tuple[int, int]):
         row_pointers = self.as_tensor(row_pointers)
         column_indices = self.as_tensor(column_indices)
+        values = self.as_tensor(values)
         return torch.sparse_csr_tensor(row_pointers, column_indices, values, shape, device=values.device)
 
     # def csr_matrix_batched(self, column_indices, row_pointers, values, shape: Tuple[int, int]):
@@ -718,36 +785,40 @@ class TorchBackend(Backend):
         #     # tile
         #     raise NotImplementedError
 
-    def conjugate_gradient(self, lin, y, x0, tol_sq, max_iter) -> SolveResult:
-        if callable(lin) or len(max_iter) > 1:
+    def conjugate_gradient(self, lin, y, x0, rtol, atol, max_iter, pre) -> SolveResult:
+        if callable(lin) or len(max_iter) > 1 or pre:
             assert self.is_available(y), "Tracing conjugate_gradient with linear operator is not yet supported."
-            return Backend.conjugate_gradient(self, lin, y, x0, tol_sq, max_iter)
+            return Backend.conjugate_gradient(self, lin, y, x0, rtol, atol, max_iter, pre)
         assert isinstance(lin, torch.Tensor), "Batched matrices are not yet supported"
         batch_size = self.staticshape(y)[0]
         y = self.to_float(y)
         x0 = self.copy(self.to_float(x0))
-        tol_sq = self.as_tensor(tol_sq)
+        rtol = self.as_tensor(rtol)
+        atol = self.as_tensor(atol)
+        tol_sq = self.maximum(rtol ** 2 * self.sum(y ** 2, -1), atol ** 2)
         max_iter = self.as_tensor(max_iter[0])
         x, residual, iterations, function_evaluations, converged, diverged = torch_sparse_cg(lin, y, x0, tol_sq, max_iter)
         return SolveResult(f"Φ-Flow CG ({'PyTorch*' if self.is_available(y) else 'TorchScript'})", x, residual, iterations, function_evaluations, converged, diverged, [""] * batch_size)
 
-    def conjugate_gradient_adaptive(self, lin, y, x0, tol_sq, max_iter) -> SolveResult:
-        if callable(lin) or len(max_iter) > 1:
+    def conjugate_gradient_adaptive(self, lin, y, x0, rtol, atol, max_iter, pre) -> SolveResult:
+        if callable(lin) or len(max_iter) > 1 or pre:
             assert self.is_available(y), "Tracing conjugate_gradient with linear operator is not yet supported."
-            return Backend.conjugate_gradient_adaptive(self, lin, y, x0, tol_sq, max_iter)
+            return Backend.conjugate_gradient_adaptive(self, lin, y, x0, rtol, atol, max_iter, pre)
         assert isinstance(lin, torch.Tensor), "Batched matrices are not yet supported"
         batch_size = self.staticshape(y)[0]
         y = self.to_float(y)
         x0 = self.copy(self.to_float(x0))
-        tol_sq = self.as_tensor(tol_sq)
+        rtol = self.as_tensor(rtol)
+        atol = self.as_tensor(atol)
+        tol_sq = self.maximum(rtol ** 2 * self.sum(y ** 2, -1), atol ** 2)
         max_iter = self.as_tensor(max_iter[0])
         x, residual, iterations, function_evaluations, converged, diverged = torch_sparse_cg_adaptive(lin, y, x0, tol_sq, max_iter)
         return SolveResult(f"Φ-Flow CG ({'PyTorch*' if self.is_available(y) else 'TorchScript'})", x, residual, iterations, function_evaluations, converged, diverged, [""] * batch_size)
 
-    def bi_conjugate_gradient(self, lin, y, x0, tol_sq, max_iter, poly_order=2) -> SolveResult:
+    def bi_conjugate_gradient(self, lin, y, x0, rtol, atol, max_iter, pre, poly_order=2) -> SolveResult:
         if not self.is_available(y):
             warnings.warn("Bi-CG is not optimized for PyTorch and will always run the maximum number of iterations.", RuntimeWarning)
-        return Backend.bi_conjugate_gradient(self, lin, y, x0, tol_sq, max_iter, poly_order)
+        return Backend.bi_conjugate_gradient(self, lin, y, x0, rtol, atol, max_iter, pre, poly_order)
 
     def matrix_solve_least_squares(self, matrix: TensorType, rhs: TensorType) -> Tuple[TensorType, TensorType, TensorType, TensorType]:
         assert version.parse(torch.__version__) >= version.parse('1.9.0'), "least squares requires PyTorch >= 1.9.0"

@@ -6,15 +6,15 @@ from typing import Tuple, Callable, Dict, Generic, List, TypeVar, Any, Set, Unio
 
 import numpy as np
 
-from ._sparse import SparseCoordinateTensor, CompressedSparseMatrix
+from . import _ops as math
+from ._magic_ops import stack
+from ._shape import EMPTY_SHAPE, Shape, spatial, instance, batch, channel
+from ._sparse import SparseCoordinateTensor
+from ._tensors import Tensor, disassemble_tree, assemble_tree, disassemble_tensors, assemble_tensors, variable_attributes, wrap, specs_equal
 from ._trace import ShiftLinTracer, matrix_from_function, LinearTraceInProgress
 from .backend import Backend, NUMPY
 from .backend._backend import get_spatial_derivative_order, functional_derivative_evaluation, PHI_LOGGER
-from ._shape import EMPTY_SHAPE, Shape, vector_add, merge_shapes, spatial, instance, batch
 from .magic import PhiTreeNode
-from ._magic_ops import stack, unpack_dim
-from ._tensors import Tensor, disassemble_tree, assemble_tree, disassemble_tensors, assemble_tensors, variable_attributes, wrap
-from . import _ops as math
 
 X = TypeVar('X')
 Y = TypeVar('Y')
@@ -50,7 +50,8 @@ class SignatureKey:
         if isinstance(cond_equal, Tensor):
             cond_equal = cond_equal.all
         # shapes need not be compared because they are included in specs
-        return self.tree == other.tree and self.specs == other.specs and self.backend == other.backend and self.spatial_derivative_order == other.spatial_derivative_order and cond_equal
+        specs = specs_equal(self.specs, other.specs)
+        return self.tree == other.tree and specs and self.backend == other.backend and self.spatial_derivative_order == other.spatial_derivative_order and cond_equal
 
     def __hash__(self):
         return hash(self.shapes) + hash(self.backend)
@@ -109,23 +110,6 @@ def key_from_args(args: tuple, kwargs: Dict[str, Any], parameters: Tuple[str, ..
     return key, tensors, natives, kwargs
 
 
-# def key_from_args_pack_batch(args, kwargs, parameters: Tuple[str, ...], cache=False) -> Tuple[SignatureKey, List[Tensor], list, Dict[str, Any], Shape]:
-#     kwargs = {**kwargs, **{parameters[i]: v for i, v in enumerate(args)}}
-#     tree, tensors = disassemble_tree(kwargs)
-#     tracing = not math.all_available(*tensors)
-#     backend = math.choose_backend_t(*tensors)
-#     # if tracing and cache:
-#     #     cache = False
-#     #     warnings.warn("Cannot cache a tensor while tracing.", RuntimeWarning)
-#     batch_shape = merge_shapes(*[t.shape.batch for t in tensors])
-#     # tensors = [math.pack_dims(t, batch_shape, batch('batch'), pos=0) for t in tensors]
-#     natives = [math.reshaped_native(t, [batch_shape, *t.shape.non_batch], force_expand=True) for t in tensors]
-#     natives, shapes, specs = disassemble_tensors(tensors, expand=cache)
-#     shapes = tuple([math.concat_shapes(batch(batch=batch_shape.volume), *t.shape.non_batch) for t in tensors])
-#     key = SignatureKey(None, tree, shapes, specs, backend, tracing, {})
-#     return key, tensors, natives, kwargs, batch_shape
-
-
 def function_parameters(f) -> Tuple[str]:
     return tuple(get_function_parameters(f).keys())
 
@@ -176,12 +160,14 @@ class JitFunction:
 
         def jit_f_native(*natives):
             PHI_LOGGER.debug(f"Φ-jit: Tracing '{f_name(self.f)}'")
+            _TRACING_JIT.append(self)
             in_tensors = assemble_tensors(natives, in_key.specs)
             kwargs = assemble_tree(in_key.tree, in_tensors)
             result = self.f(**kwargs, **in_key.auxiliary_kwargs)  # Tensor or tuple/list of Tensors
             tree, out_tensors = disassemble_tree(result)
             result_natives, result_shapes, specs = disassemble_tensors(out_tensors, expand=True)
             self.recorded_mappings[in_key] = SignatureKey(jit_f_native, tree, result_shapes, specs, in_key.backend, in_key.tracing)
+            assert _TRACING_JIT.pop(-1) is self
             return result_natives
 
         jit_f_native.__name__ = f"native({f_name(self.f) if isinstance(self.f, types.FunctionType) else str(self.f)})"
@@ -218,6 +204,9 @@ Set forget_traces=True to avoid memory leaks when many traces are required.""", 
     @property
     def __name__(self):
         return f_name(self.f)
+
+
+_TRACING_JIT: List[JitFunction] = []
 
 
 def jit_compile(f: Callable = None, auxiliary_args: str = '', forget_traces: bool = None) -> Callable:
@@ -285,18 +274,20 @@ class LinearFunction(Generic[X, Y], Callable[[X], Y]):
         self.matrices_and_biases: Dict[SignatureKey, Tuple[SparseCoordinateTensor, Tensor]] = {}
         self.nl_jit = JitFunction(f, self.auxiliary_args, forget_traces)  # for backends that do not support sparse matrices
 
-    def _trace(self, in_key: SignatureKey, prefer_numpy: bool) -> 'ShiftLinTracer':
-        assert in_key.shapes[0].is_uniform, f"math.jit_compile_linear() only supports uniform tensors for function input and output but input shape was {in_key.shapes[0]}"
-        with NUMPY if prefer_numpy else in_key.backend:
-            x = math.ones(in_key.shapes[0])
-            tracer = ShiftLinTracer(x, {EMPTY_SHAPE: math.ones()}, x.shape, math.zeros(x.shape))
-        x_kwargs = assemble_tree(in_key.tree, [tracer])
-        result = self.f(**x_kwargs, **in_key.auxiliary_kwargs)
-        _, result_tensors = disassemble_tree(result)
-        assert len(result_tensors) == 1, f"Linear function must return a single Tensor or tensor-like but got {result}"
-        result_tensor = result_tensors[0]
-        assert isinstance(result_tensor, ShiftLinTracer), f"Tracing linear function '{f_name(self.f)}' failed. Make sure only linear operations are used."
-        return result_tensor
+    # def _trace(self, in_key: SignatureKey, prefer_numpy: bool) -> 'ShiftLinTracer':
+    #     assert in_key.shapes[0].is_uniform, f"math.jit_compile_linear() only supports uniform tensors for function input and output but input shape was {in_key.shapes[0]}"
+    #     with NUMPY if prefer_numpy else in_key.backend:
+    #         x = math.ones(in_key.shapes[0])
+    #         tracer = ShiftLinTracer(x, {EMPTY_SHAPE: math.ones()}, x.shape, math.zeros(x.shape))
+    #     _TRACING_JIT.append(self)
+    #     x_kwargs = assemble_tree(in_key.tree, [tracer])
+    #     result = self.f(**x_kwargs, **in_key.auxiliary_kwargs)
+    #     _, result_tensors = disassemble_tree(result)
+    #     assert len(result_tensors) == 1, f"Linear function must return a single Tensor or tensor-like but got {result}"
+    #     result_tensor = result_tensors[0]
+    #     assert isinstance(result_tensor, ShiftLinTracer), f"Tracing linear function '{f_name(self.f)}' failed. Make sure only linear operations are used."
+    #     assert _TRACING_JIT.pop(-1) is self
+    #     return result_tensor
 
     def _get_or_trace(self, key: SignatureKey, args: tuple, f_kwargs: dict):
         if not key.tracing and key in self.matrices_and_biases:
@@ -1022,6 +1013,33 @@ def map_s2b(f: Callable) -> Callable:
 def map_i2b(f: Callable) -> Callable:
     """ Map instance dimensions to batch dimensions. Short for `map_types(f, instance, batch)`. """
     return map_types(f, instance, batch)
+
+
+def map_c2b(f: Callable) -> Callable:
+    """ Map channel dimensions to batch dimensions. Short for `map_types(f, instance, batch)`. """
+    return map_types(f, channel, batch)
+
+
+def broadcast(f):
+    """
+    Function decorator for non-vectorized functions.
+    When passing a `Tensor` argument to a broadcast function, the function is called once for each element of the tensor.
+
+    Only positionsl arguments, not keyword arguments are broadcast.
+
+    See Also:
+        `phi.math.map`
+
+    Args:
+        f: Function.
+
+    Returns:
+        Broadcast function
+    """
+    @wraps(f)
+    def broadcast_(*args, **kwargs):
+        return math.map_(f, *args, **kwargs)
+    return broadcast_
 
 
 def iterate(f: Callable,

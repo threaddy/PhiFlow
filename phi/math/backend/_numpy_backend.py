@@ -1,14 +1,14 @@
 import numbers
 import os
 import sys
-from typing import List, Any, Callable, Union
+from typing import Union, Optional
 
 import numpy as np
 import numpy.random
 import scipy.signal
 import scipy.sparse
 from scipy.sparse import issparse
-from scipy.sparse.linalg import cg, spsolve
+from scipy.sparse.linalg import spsolve_triangular
 
 from . import Backend, ComputeDevice
 from ._backend import combined_dim, SolveResult, TensorType
@@ -41,7 +41,6 @@ class NumPyBackend(Backend):
     concat = staticmethod(np.concatenate)
     stack = staticmethod(np.stack)
     tile = staticmethod(np.tile)
-    repeat = staticmethod(np.repeat)
     transpose = staticmethod(np.transpose)
     sqrt = np.sqrt
     exp = np.exp
@@ -62,11 +61,14 @@ class NumPyBackend(Backend):
     log2 = np.log2
     log10 = np.log10
     isfinite = np.isfinite
+    isnan = np.isnan
+    isinf = np.isinf
     abs = np.abs
     sign = np.sign
     round = staticmethod(np.round)
     ceil = np.ceil
     floor = np.floor
+    log_gamma = np.math.lgamma
     shape = staticmethod(np.shape)
     staticshape = staticmethod(np.shape)
     imag = staticmethod(np.imag)
@@ -108,11 +110,14 @@ class NumPyBackend(Backend):
             return all([self.is_tensor(item, False) for item in x])
         return False
 
+    def is_sparse(self, x) -> bool:
+        return issparse(x)
+
     def is_available(self, tensor):
         return True
 
     def numpy(self, tensor):
-        if isinstance(tensor, np.ndarray):
+        if isinstance(tensor, np.ndarray) or issparse(tensor):
             return tensor
         else:
             return np.array(tensor)
@@ -139,7 +144,10 @@ class NumPyBackend(Backend):
             result = x / y
         return np.where(y == 0, 0, result)
 
-    def random_uniform(self, shape, low, high, dtype: Union[DType, None]):
+    def softplus(self, x):
+        return np.log1p(np.exp(-np.abs(x))) + np.maximum(x, 0)
+
+    def random_uniform(self, shape, low, high, dtype: Optional[DType]):
         dtype = dtype or self.float_type
         if dtype.kind == float:
             return np.random.uniform(low, high, shape).astype(to_numpy_dtype(dtype))
@@ -196,8 +204,14 @@ class NumPyBackend(Backend):
     def linspace(self, start, stop, number):
         return np.linspace(start, stop, number, dtype=to_numpy_dtype(self.float_type))
 
+    def linspace_without_last(self, start, stop, number):
+        return np.linspace(start, stop, number, dtype=to_numpy_dtype(self.float_type), endpoint=False)
+
     def mean(self, value, axis=None, keepdims=False):
         return np.mean(value, axis, keepdims=keepdims)
+
+    def repeat(self, x, repeats, axis: int, new_length=None):
+        return np.repeat(x, repeats, axis)
 
     def tensordot(self, a, a_axes: Union[tuple, list], b, b_axes: Union[tuple, list]):
         return np.tensordot(a, b, (a_axes, b_axes))
@@ -250,6 +264,18 @@ class NumPyBackend(Backend):
         else:
             return np.array(x, to_numpy_dtype(dtype))
 
+    def unravel_index(self, flat_index, shape):
+        return np.stack(np.unravel_index(flat_index, shape), -1)
+
+    def ravel_multi_index(self, multi_index, shape, mode: Union[str, int] = 'undefined'):
+        mode = mode if isinstance(mode, int) else {'undefined': 'raise', 'periodic': 'wrap', 'clamp': 'clip'}[mode]
+        idx_first = np.transpose(multi_index, (-1,) + tuple(range(self.ndims(multi_index)-1)))
+        result = np.ravel_multi_index(idx_first, shape, mode='wrap' if isinstance(mode, int) else mode)
+        if isinstance(mode, int):
+            outside = self.any((multi_index < 0) | (multi_index >= shape), -1)
+            result = self.where(outside, mode, result)
+        return result
+
     def gather(self, values, indices, axis: int):
         slices = [indices if i == axis else slice(None) for i in range(self.ndims(values))]
         return values[tuple(slices)]
@@ -267,9 +293,16 @@ class NumPyBackend(Backend):
     def std(self, x, axis=None, keepdims=False):
         return np.std(x, axis, keepdims=keepdims)
 
-    def boolean_mask(self, x, mask, axis=0):
+    def boolean_mask(self, x, mask, axis=0, new_length=None, fill_value=0):
         slices = [mask if i == axis else slice(None) for i in range(len(x.shape))]
-        return x[tuple(slices)]
+        result = x[tuple(slices)]
+        if new_length is not None:
+            if new_length > result.shape[axis]:
+                pad_width = [(0, new_length - result.shape[axis]) if i == axis else (0, 0) for i in range(len(x.shape))]
+                result = np.pad(result, pad_width, mode='constant', constant_values=fill_value)
+            elif new_length < result.shape[axis]:
+                result = result[tuple([slice(new_length) if i == axis else slice(None) for i in range(len(x.shape))])]
+        return result
 
     def any(self, boolean_tensor, axis=None, keepdims=False):
         return np.any(boolean_tensor, axis=axis, keepdims=keepdims)
@@ -306,8 +339,30 @@ class NumPyBackend(Backend):
         #     return array / count
         return result
 
+    def histogram1d(self, values, weights, bin_edges):
+        batch_size, value_count = self.staticshape(values)
+        result = []
+        for b in range(batch_size):
+            hist, _ = np.histogram(values[b], bins=bin_edges[b], weights=weights[b])
+            result.append(hist)
+        return np.stack(result)
+
+    def bincount(self, x, weights, bins: int):
+        result = np.bincount(x, weights=weights, minlength=bins)
+        assert result.shape[-1] == bins
+        return result
+
     def quantile(self, x, quantiles):
         return np.quantile(x, quantiles, axis=-1)
+
+    def argsort(self, x, axis=-1):
+        return np.argsort(x, axis)
+
+    def searchsorted(self, sorted_sequence, search_values, side: str, dtype=DType(int, 32)):
+        if self.ndims(sorted_sequence) == 1:
+            return np.searchsorted(sorted_sequence, search_values, side=side).astype(to_numpy_dtype(dtype))
+        else:
+            return np.stack([self.searchsorted(seq, val, side, dtype) for seq, val in zip(sorted_sequence, search_values)])
 
     def fft(self, x, axes: Union[tuple, list]):
         x = self.to_complex(x)
@@ -400,82 +455,11 @@ class NumPyBackend(Backend):
     #             return grads
     #     return gradient
 
-    def linear_solve(self, method: str, lin, y, x0, tol_sq, max_iter) -> SolveResult:
-        if method == 'direct':
-            return self.direct_linear_solve(lin, y)
-        elif method == 'CG-native':
-            return self.scipy_iterative_sparse_solve(lin, y, x0, tol_sq, max_iter, scipy_function=scipy.sparse.linalg.cg)
-        elif method == 'GMres':
-            return self.scipy_iterative_sparse_solve(lin, y, x0, tol_sq, max_iter, scipy_function=scipy.sparse.linalg.gmres)
-        elif method == 'biCG':
-            return self.scipy_iterative_sparse_solve(lin, y, x0, tol_sq, max_iter, scipy_function=scipy.sparse.linalg.bicg)
-        elif method == 'CGS':
-            return self.scipy_iterative_sparse_solve(lin, y, x0, tol_sq, max_iter, scipy_function=scipy.sparse.linalg.cgs)
-        elif method == 'lGMres':
-            return self.scipy_iterative_sparse_solve(lin, y, x0, tol_sq, max_iter, scipy_function=scipy.sparse.linalg.lgmres)
-        # elif method == 'minres':
-        #     return self.scipy_iterative_sparse_solve(lin, y, x0, tol_sq, max_iter, scipy_function=scipy.sparse.linalg.minres)
-        elif method == 'QMR':
-            return self.scipy_iterative_sparse_solve(lin, y, x0, tol_sq, max_iter, scipy_function=scipy.sparse.linalg.qmr)
-        elif method == 'GCrotMK':
-            return self.scipy_iterative_sparse_solve(lin, y, x0, tol_sq, max_iter, scipy_function=scipy.sparse.linalg.gcrotmk)
-        elif method == 'auto':
-            return self.conjugate_gradient_adaptive(lin, y, x0, tol_sq, max_iter)
-            # return self.conjugate_gradient(lin, y, x0, tol_sq, max_iter, trj)
-        else:
-            return Backend.linear_solve(self, method, lin, y, x0, tol_sq, max_iter)
-
-    def direct_linear_solve(self, lin, y) -> Any:
-        batch_size = self.staticshape(y)[0]
-        xs = []
-        converged = []
-        if isinstance(lin, (tuple, list)):
-            assert all(issparse(l) for l in lin)
-        else:
-            assert issparse(lin)
-            lin = [lin] * batch_size
-        # Solve each example independently
-        for batch in range(batch_size):
-            # use_umfpack=self.precision == 64
-            x = spsolve(lin[batch], y[batch])  # returns nan when diverges
-            xs.append(x)
-            converged.append(np.all(np.isfinite(x)))
-        x = np.stack(xs)
-        converged = np.stack(converged)
-        diverged = ~converged
-        iterations = [-1] * batch_size  # spsolve does not perform iterations
-        return SolveResult('scipy.sparse.linalg.spsolve', x, None, iterations, iterations, converged, diverged, [""] * batch_size)
-
-    def conjugate_gradient(self, lin, y, x0, tol_sq, max_iter) -> SolveResult:
-        if len(max_iter) > 1 or callable(lin):
-            return Backend.conjugate_gradient(self, lin, y, x0, tol_sq, max_iter)  # generic implementation
-        else:
-            return self.scipy_iterative_sparse_solve(lin, y, x0, tol_sq, max_iter, scipy_function=scipy.sparse.linalg.bicg)  # more stable than cg
-
-    def scipy_iterative_sparse_solve(self, lin, y, x0, tol_sq, max_iter, scipy_function=cg) -> SolveResult:
-        bs_y = self.staticshape(y)[0]
-        bs_x0 = self.staticshape(x0)[0]
-        batch_size = combined_dim(bs_y, bs_x0)
-        # if callable(A):
-        #     A = LinearOperator(dtype=y.dtype, shape=(self.staticshape(y)[-1], self.staticshape(x0)[-1]), matvec=A)
-
-        def count_callback(x_n):  # called after each step, not with x0
-            iterations[b] += 1
-
-        xs = []
-        iterations = [0] * batch_size
-        converged = []
-        diverged = []
-        for b in range(batch_size):
-            lin_b = lin[min(b, len(lin)-1)] if isinstance(lin, (tuple, list)) or (isinstance(lin, np.ndarray) and len(lin.shape) > 2) else lin
-            x, ret_val = scipy_function(lin_b, y[b], x0=x0[b], tol=0, atol=np.sqrt(tol_sq[b]), maxiter=max_iter[-1, b], callback=count_callback)
-            # ret_val: 0=success, >0=not converged, <0=error
-            xs.append(x)
-            converged.append(ret_val == 0)
-            diverged.append(ret_val < 0 or np.any(~np.isfinite(x)))
-        x = np.stack(xs)
-        f_eval = [i + 1 for i in iterations]
-        return SolveResult(f'scipy.sparse.linalg.{scipy_function.__name__}', x, None, iterations, f_eval, converged, diverged, [""] * batch_size)
+    def linear_solve(self, method: str, lin, y, x0, rtol, atol, max_iter, pre) -> SolveResult:
+        if method in ['direct', 'CG-native', 'GMres', 'biCG', 'biCG-stab', 'CGS', 'lGMres', 'minres', 'QMR', 'GCrotMK'] and max_iter.shape[0] == 1:
+            from phi.math.backend._linalg import scipy_spsolve
+            return scipy_spsolve(self, method, lin, y, x0, rtol, atol, max_iter, pre)
+        return Backend.linear_solve(self, method, lin, y, x0, rtol, atol, max_iter, pre)
 
     def matrix_solve_least_squares(self, matrix: TensorType, rhs: TensorType) -> TensorType:
         solution, residuals, rank, singular_values = [], [], [], []
@@ -494,3 +478,6 @@ class NumPyBackend(Backend):
             x = scipy.linalg.solve_triangular(matrix[b, :, :], rhs[b, :], lower=lower, unit_diagonal=unit_diagonal)
             result.append(x)
         return np.stack(result)
+
+    def solve_triangular_sparse(self, matrix, rhs, lower: bool, unit_diagonal: bool):  # needs to be overridden to indicate this is natively implemented
+        return spsolve_triangular(matrix, rhs.T, lower=lower, unit_diagonal=unit_diagonal).T

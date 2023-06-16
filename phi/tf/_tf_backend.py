@@ -54,6 +54,9 @@ class TFBackend(Backend):
         else:
             return is_tf_tensor or NUMPY.is_tensor(x, only_native=False)
 
+    def is_sparse(self, x) -> bool:
+        return isinstance(x, tf.SparseTensor)
+
     def as_tensor(self, x, convert_external=True):
         with tf.device(self._default_device.ref):
             if self.is_tensor(x, only_native=convert_external):
@@ -74,6 +77,12 @@ class TFBackend(Backend):
             return True
 
     def numpy(self, tensor):
+        if self.is_sparse(tensor):
+            indices = np.array(tensor.indices)
+            values = np.array(tensor.values)
+            indices = indices[..., 0], indices[..., 1]
+            from scipy.sparse import coo_matrix
+            return coo_matrix((values, indices), shape=self.staticshape(tensor))
         if tf.is_tensor(tensor):
             return tensor.numpy()
         return NUMPY.numpy(tensor)
@@ -103,6 +112,16 @@ class TFBackend(Backend):
             result = tf.identity(tensor)
             assert self.get_device(result) == device
             return result
+
+    def vectorized_call(self, f, *args, output_dtypes=None, **aux_args):
+        batch_size = self.determine_size(args, 0)
+        args = [self.tile_to(t, 0, batch_size) for t in args]
+        if output_dtypes is None:
+            output0 = f(*[t[0] for t in args], **aux_args)  # Call f to determine its output signature.
+            output_dtypes = tf.nest.map_structure(lambda x: x.dtype, output0)
+        else:
+            output_dtypes = tf.nest.map_structure(lambda dtype: to_numpy_dtype(dtype), output_dtypes)
+        return tf.map_fn(lambda vals: f(*vals, **aux_args), tuple(args), fn_output_signature=output_dtypes)
 
     def jit_compile(self, f: Callable) -> Callable:
         compiled = tf.function(f)
@@ -156,7 +175,7 @@ class TFBackend(Backend):
                 value = self.expand_dims(value, axis=0, number=len(multiples) - self.ndims(value))
             return tf.tile(value, multiples)
 
-    def repeat(self, x, repeats, axis: int):
+    def repeat(self, x, repeats, axis: int, new_length=None):
         x = self.as_tensor(x)
         with tf.device(x.device):
             return tf.repeat(x, repeats, axis)
@@ -366,6 +385,14 @@ class TFBackend(Backend):
         with tf.device(x.device):
             return tf.exp(x)
 
+    def softplus(self, x):
+        with tf.device(x.device):
+            return tf.math.softplus(x)
+
+    def log_gamma(self, x):
+        with tf.device(x.device):
+            return tf.math.lgamma(self.to_float(x))
+
     def conv(self, value, kernel, zero_padding=True):
         with self._device_for(value, kernel):
             value = self.to_float(value)
@@ -412,7 +439,12 @@ class TFBackend(Backend):
 
     def gather(self, values, indices, axis: int):
         with self._device_for(values, indices):
+            indices = indices % self.cast(self.shape(values)[axis], self.dtype(indices))
             return tf.gather(values, indices, axis=axis)
+
+    def gather_by_component_indices(self, values, *component_indices):
+        indices = self.stack(component_indices, -1)
+        return tf.gather_nd(values, indices)
 
     def batched_gather_nd(self, values, indices):
         with self._device_for(values, indices):
@@ -438,13 +470,27 @@ class TFBackend(Backend):
             _mean, var = tf.nn.moments(x, axis, keepdims=keepdims)
             return tf.sqrt(var)
 
-    def boolean_mask(self, x, mask, axis=0):
+    def boolean_mask(self, x, mask, axis=0, new_length=None, fill_value=0):
         with self._device_for(x, mask):
             return tf.boolean_mask(x, mask, axis=axis)
 
     def isfinite(self, x):
+        if self.dtype(x).kind in (bool, int):
+            return self.ones(self.shape(x), dtype=DType(bool))
         with tf.device(x.device):
             return tf.math.is_finite(x)
+
+    def isnan(self, x):
+        if self.dtype(x).kind in (bool, int):
+            return self.zeros(self.shape(x), dtype=DType(bool))
+        with tf.device(x.device):
+            return tf.math.is_nan(x)
+
+    def isinf(self, x):
+        if self.dtype(x).kind in (bool, int):
+            return self.zeros(self.shape(x), dtype=DType(bool))
+        with tf.device(x.device):
+            return tf.math.is_inf(x)
 
     def any(self, boolean_tensor, axis=None, keepdims=False):
         with tf.device(boolean_tensor.device):
@@ -465,6 +511,12 @@ class TFBackend(Backend):
             result = tfp.stats.percentile(x, quantiles * 100, axis=-1, interpolation='linear')
             return result
 
+    def argsort(self, x, axis=-1):
+        return tf.argsort(x, axis)
+
+    def searchsorted(self, sorted_sequence, search_values, side: str, dtype=DType(int, 32)):
+        return tf.searchsorted(sorted_sequence, search_values, side=side, out_type=to_numpy_dtype(dtype))
+
     def scatter(self, base_grid, indices, values, mode: str):
         with self._device_for(base_grid, indices, values):
             base_grid, values = self.auto_cast(base_grid, values)
@@ -478,6 +530,16 @@ class TFBackend(Backend):
                 b_values = values[min(b, values.shape[0] - 1), ...]
                 result.append(scatter(b_grid, b_indices, b_values))
             return self.stack(result, axis=0)
+
+    def histogram1d(self, values, weights, bin_edges):
+        with self._device_for(values, weights, bin_edges):
+            bin_count = self.staticshape(bin_edges)[-1] - 1
+            bin_indices = tf.minimum(tf.searchsorted(bin_edges, values, side='right') - 1, bin_count - 1)  # ToDo this includes values outside
+            hist = tf.math.bincount(bin_indices, weights=weights, minlength=bin_count, maxlength=bin_count, axis=-1)
+            return hist
+
+    def bincount(self, x, weights, bins: int):
+        return tf.math.bincount(x, weights=weights, minlength=bins, maxlength=bins)
 
     def fft(self, x, axes: Union[tuple, list]):
         if not axes:
@@ -535,6 +597,10 @@ class TFBackend(Backend):
         else:
             with tf.device(x.device):
                 return tf.cast(x, to_numpy_dtype(dtype))
+
+    def unravel_index(self, flat_index, shape):
+        idx_first = tf.unravel_index(flat_index, shape)
+        return tf.transpose(idx_first, perm=tuple(range(1, self.ndims(flat_index)+1)) + (0,))
 
     def sin(self, x):
         with tf.device(x.device):

@@ -1,14 +1,14 @@
 import copy
 import warnings
 from numbers import Number
-from typing import TypeVar, Tuple, Set, Dict, Union
+from typing import TypeVar, Tuple, Set, Dict, Union, Optional
 
 import dataclasses
 
 from . import channel
 from .backend import choose_backend, NoBackendFound
 from .backend._dtype import DType
-from ._shape import Shape, DimFilter, batch, instance, shape, non_batch, merge_shapes, concat_shapes, spatial, parse_dim_order
+from ._shape import Shape, DimFilter, batch, instance, shape, non_batch, merge_shapes, concat_shapes, spatial, parse_dim_order, dual
 from .magic import Sliceable, Shaped, Shapable, PhiTreeNode
 
 
@@ -233,7 +233,7 @@ def stack(values: Union[tuple, list, dict], dim: Shape, expand_values=False, **k
         return values[0]
 
 
-def concat(values: Union[tuple, list], dim: Union[str, Shape], **kwargs):
+def concat(values: Union[tuple, list], dim: Union[str, Shape], expand_values=False, **kwargs):
     """
     Concatenates a sequence of `phi.math.magic.Shapable` objects, e.g. `Tensor`, along one dimension.
     All values must have the same spatial, instance and channel dimensions and their sizes must be equal, except for `dim`.
@@ -243,6 +243,9 @@ def concat(values: Union[tuple, list], dim: Union[str, Shape], **kwargs):
         values: Tuple or list of `phi.math.magic.Shapable`, such as `phi.math.Tensor`
         dim: Concatenation dimension, must be present in all `values`.
             The size along `dim` is determined from `values` and can be set to undefined (`None`).
+        expand_values: If `True`, will first add missing dimensions to all values, not just batch dimensions.
+            This allows tensors with different dimensions to be concatenated.
+            The resulting tensor will have all dimensions that are present in `values`.
         **kwargs: Additional keyword arguments required by specific implementations.
             Adding spatial dimensions to fields requires the `bounds: Box` argument specifying the physical extent of the new dimensions.
             Adding batch dimensions must always work without keyword arguments.
@@ -261,13 +264,18 @@ def concat(values: Union[tuple, list], dim: Union[str, Shape], **kwargs):
     if isinstance(dim, Shape):
         dim = dim.name
     assert isinstance(dim, str), f"dim must be a str or Shape but got '{dim}' of type {type(dim)}"
-    for v in values:
-        assert dim in shape(v), f"dim must be present in the shapes of all values bot got value {type(v).__name__} with shape {shape(v)}"
-    for v in values[1:]:
-        assert set(non_batch(v).names) == set(non_batch(values[0]).names), f"Concatenated values must have the same non-batch dimensions but got {non_batch(values[0])} and {non_batch(v)}"
-    # Add missing batch dimensions
-    all_batch_dims = merge_shapes(*[batch(v) for v in values])
-    values = [expand(v, all_batch_dims) for v in values]
+    # Add missing dimensions
+    if expand_values:
+        all_dims = merge_shapes(*values, allow_varying_sizes=True)
+        all_dims = all_dims.with_dim_size(dim, 1, keep_item_names=False)
+        values = [expand(v, all_dims.without(shape(v))) for v in values]
+    else:
+        for v in values:
+            assert dim in shape(v), f"dim must be present in the shapes of all values bot got value {type(v).__name__} with shape {shape(v)}"
+        for v in values[1:]:
+            assert set(non_batch(v).names) == set(non_batch(values[0]).names), f"Concatenated values must have the same non-batch dimensions but got {non_batch(values[0])} and {non_batch(v)}"
+        all_batch_dims = merge_shapes(*[batch(v) for v in values])
+        values = [expand(v, all_batch_dims) for v in values]
     # --- First try __concat__ ---
     for v in values:
         if isinstance(v, Shapable):
@@ -353,8 +361,7 @@ def expand(value, *dims: Shape, **kwargs):
             assert value is not NotImplemented, "Value must implement either __expand__ or __stack__"
         return value
     try:  # value may be a native scalar
-        from ._ops import expand_tensor
-        from ._tensors import wrap
+        from ._tensors import expand_tensor, wrap
         value = wrap(value)
     except ValueError:
         raise AssertionError(f"Cannot expand non-shapable object {type(value)}")
@@ -419,7 +426,32 @@ def rename_dims(value,
     return value
 
 
-def pack_dims(value, dims: DimFilter, packed_dim: Shape, pos: Union[int, None] = None, **kwargs):
+def b2i(value):
+    """ Change the type of all *batch* dimensions of `value` to *instance* dimensions. See `rename_dims`. """
+    return rename_dims(value, batch, instance)
+
+
+def c2b(value):
+    """ Change the type of all *channel* dimensions of `value` to *batch* dimensions. See `rename_dims`. """
+    return rename_dims(value, channel, batch)
+
+
+def s2b(value):
+    """ Change the type of all *spatial* dimensions of `value` to *batch* dimensions. See `rename_dims`. """
+    return rename_dims(value, spatial, batch)
+
+
+def si2d(value):
+    """ Change the type of all *spatial* and *instance* dimensions of `value` to *dual* dimensions. See `rename_dims`. """
+    return rename_dims(value, lambda s: s.non_channel.non_dual.non_batch, dual)
+
+
+def i2b(value):
+    """ Change the type of all *instance* dimensions of `value` to *batch* dimensions. See `rename_dims`. """
+    return rename_dims(value, instance, batch)
+
+
+def pack_dims(value, dims: DimFilter, packed_dim: Shape, pos: Optional[int] = None, **kwargs):
     """
     Compresses multiple dimensions into a single dimension by concatenating the elements.
     Elements along the new dimensions are laid out according to the order of `dims`.
@@ -477,7 +509,7 @@ def pack_dims(value, dims: DimFilter, packed_dim: Shape, pos: Union[int, None] =
 
 
 
-def unpack_dim(value, dim: Union[str, Shape], *unpacked_dims: Shape, **kwargs):
+def unpack_dim(value, dim: DimFilter, *unpacked_dims: Shape, **kwargs):
     """
     Decompresses a dimension by unstacking the elements along it.
     This function replaces the traditional `reshape` for these cases.
@@ -490,7 +522,7 @@ def unpack_dim(value, dim: Union[str, Shape], *unpacked_dims: Shape, **kwargs):
 
     Args:
         value: `phi.math.magic.Shapable`, such as `Tensor`, for which one dimension should be split.
-        dim: Dimension to be decompressed.
+        dim: Single dimension to be decompressed.
         *unpacked_dims: Vararg `Shape`, ordered dimensions to replace `dim`, fulfilling `unpacked_dims.volume == shape(self)[dim].rank`.
         **kwargs: Additional keyword arguments required by specific implementations.
             Adding spatial dimensions to fields requires the `bounds: Box` argument specifying the physical extent of the new dimensions.
@@ -506,11 +538,11 @@ def unpack_dim(value, dim: Union[str, Shape], *unpacked_dims: Shape, **kwargs):
     if isinstance(value, (Number, bool)):
         return value
     assert isinstance(value, Shapable) and isinstance(value, Sliceable) and isinstance(value, Shaped), f"value must be Shapable but got {type(value)}"
-    if isinstance(dim, Shape):
-        dim = dim.name
-    assert isinstance(dim, str), f"dim must be a str or Shape but got {type(dim)}"
-    if dim not in shape(value):
+    dim = shape(value).only(dim)
+    if dim.is_empty:
         return value  # Nothing to do, maybe expand?
+    assert dim.rank == 1, f"unpack_dim requires as single dimension to be unpacked but got {dim}"
+    dim = dim.name
     unpacked_dims = concat_shapes(*unpacked_dims)
     if unpacked_dims.rank == 0:
         return value[{dim: 0}]  # remove dim

@@ -68,9 +68,9 @@ class PlotlyPlots(PlottingLibrary):
 class LinePlot(Recipe):
 
     def can_plot(self, data: SampledField, space: Box) -> bool:
-        return data.spatial_rank == 1 and isinstance(data, Grid)
+        return data.spatial_rank == 1 and data.is_grid
 
-    def plot(self, data: SampledField, figure, subplot, space: Box, min_val: float, max_val: float, show_color_bar: bool, color: Tensor, alpha: Tensor):
+    def plot(self, data: SampledField, figure, subplot, space: Box, min_val: float, max_val: float, show_color_bar: bool, color: Tensor, alpha: Tensor, err: Tensor):
         row, col = subplot
         subplot = figure.get_subplot(row, col)
         x = data.points.vector[0].numpy().flatten()
@@ -92,9 +92,9 @@ class LinePlot(Recipe):
 class Heatmap2D(Recipe):
 
     def can_plot(self, data: SampledField, space: Box) -> bool:
-        return data.spatial_rank == 2 and isinstance(data, Grid) and 'vector' not in data.shape
+        return data.spatial_rank == 2 and data.is_grid and 'vector' not in data.shape
 
-    def plot(self, data: SampledField, figure, subplot, space: Box, min_val: float, max_val: float, show_color_bar: bool, color: Tensor, alpha: Tensor):
+    def plot(self, data: SampledField, figure, subplot, space: Box, min_val: float, max_val: float, show_color_bar: bool, color: Tensor, alpha: Tensor, err: Tensor):
         row, col = subplot
         dims = spatial(data)
         values = real_values(data).numpy(dims.reversed)
@@ -110,17 +110,17 @@ class Heatmap2D(Recipe):
 class VectorField2D(Recipe):
 
     def can_plot(self, data: SampledField, space: Box) -> bool:
-        return data.spatial_rank == 2 and isinstance(data, Grid)
+        return data.spatial_rank == 2 and data.is_grid
 
-    def plot(self, data: SampledField, figure, subplot, space: Box, min_val: float, max_val: float, show_color_bar: bool, color: Tensor, alpha: Tensor):
-        if isinstance(data, StaggeredGrid):
+    def plot(self, data: SampledField, figure, subplot, space: Box, min_val: float, max_val: float, show_color_bar: bool, color: Tensor, alpha: Tensor, err: Tensor):
+        if data.is_staggered:
             data = data.at_centers()
         row, col = subplot
         dims = data.bounds.vector.item_names
         vector = data.bounds.shape['vector']
         extra_channels = data.shape.channel.without('vector')
-        x, y = math.reshaped_numpy(data.points.vector[dims], [vector, data.shape.non_channel], force_expand=True)
-        u, v = math.reshaped_numpy(data.values.vector[dims], [vector, extra_channels, data.shape.without(vector)], force_expand=True)
+        x, y = math.reshaped_numpy(data.points.vector[dims], [vector, data.shape.non_channel])
+        u, v = math.reshaped_numpy(data.values.vector[dims], [vector, extra_channels, data.shape.without(vector)])
         for ch in range(u.shape[0]):
             # quiver = figure_factory.create_quiver(x, y, data_x[ch], data_y[ch], scale=1.0)  # 7 points per arrow
             # fig.add_trace(quiver, row=row, col=col)
@@ -139,9 +139,9 @@ class VectorField2D(Recipe):
 class Heatmap3D(Recipe):
 
     def can_plot(self, data: SampledField, space: Box) -> bool:
-        return data.spatial_rank == 3 and isinstance(data, Grid) and data.shape.channel.volume == 1
+        return data.spatial_rank == 3 and data.is_grid and data.shape.channel.volume == 1
 
-    def plot(self, data: SampledField, figure, subplot, space: Box, min_val: float, max_val: float, show_color_bar: bool, color: Tensor, alpha: Tensor):
+    def plot(self, data: SampledField, figure, subplot, space: Box, min_val: float, max_val: float, show_color_bar: bool, color: Tensor, alpha: Tensor, err: Tensor):
         row, col = subplot
         dims = data.bounds.vector.item_names
         vector = data.bounds.shape['vector']
@@ -162,17 +162,17 @@ class Heatmap3D(Recipe):
 class VectorField3D(Recipe):
 
     def can_plot(self, data: SampledField, space: Box) -> bool:
-        return isinstance(data, Grid) and data.spatial_rank == 3
+        return data.is_grid and data.spatial_rank == 3
 
-    def plot(self, data: SampledField, figure, subplot, space: Box, min_val: float, max_val: float, show_color_bar: bool, color: Tensor, alpha: Tensor):
+    def plot(self, data: SampledField, figure, subplot, space: Box, min_val: float, max_val: float, show_color_bar: bool, color: Tensor, alpha: Tensor, err: Tensor):
         row, col = subplot
         dims = data.bounds.vector.item_names
         vector = data.bounds.shape['vector']
         extra_channels = data.shape.channel.without('vector')
-        if isinstance(data, StaggeredGrid):
+        if data.is_staggered:
             data = data.at_centers()
         x, y, z = math.reshaped_numpy(data.points.vector[dims], [vector, data.shape.non_channel])
-        u, v, w = math.reshaped_numpy(data.values.vector[dims], [vector, extra_channels, data.shape.non_channel], force_expand=True)
+        u, v, w = math.reshaped_numpy(data.values.vector[dims], [vector, extra_channels, data.shape.non_channel])
         figure.add_cone(x=x.flatten(), y=y.flatten(), z=z.flatten(), u=u.flatten(), v=v.flatten(), w=w.flatten(),
                         colorscale='Blues',
                         sizemode="absolute", sizeref=1,
@@ -182,32 +182,28 @@ class VectorField3D(Recipe):
 class VectorCloud2D(Recipe):
 
     def can_plot(self, data: SampledField, space: Box) -> bool:
-        return isinstance(data, PointCloud) and data.spatial_rank == 2 and 'vector' in channel(data)
+        return data.is_point_cloud and data.spatial_rank == 2 and 'vector' in channel(data)
 
-    def plot(self, data: SampledField, figure, subplot, space: Box, min_val: float, max_val: float, show_color_bar: bool, color: Tensor, alpha: Tensor):
+    def plot(self, data: SampledField, figure, subplot, space: Box, min_val: float, max_val: float, show_color_bar: bool, color: Tensor, alpha: Tensor, err: Tensor):
         row, col = subplot
         vector = data.bounds.shape['vector']
         x, y = math.reshaped_numpy(data.points, [vector, data.shape.without('vector')])
-        u, v = math.reshaped_numpy(data.values, [vector, data.shape.without('vector')], force_expand=True)
+        u, v = math.reshaped_numpy(data.values, [vector, data.shape.without('vector')])
         quiver = figure_factory.create_quiver(x, y, u, v, scale=1.0).data[0]  # 7 points per arrow
-        if data.color.shape:
-            # color = data.color.numpy(data.shape.non_channel).reshape(-1)
-            warnings.warn("Multi-colored vector plots not yet supported")
-        else:
-            color = data.color.native()
-            quiver.line.update(color=color)
+        if (color != None).all:
+            quiver.line.update(color=color.native())
         figure.add_trace(quiver, row=row, col=col)
 
 
 class PointCloud2D(Recipe):
 
     def can_plot(self, data: SampledField, space: Box) -> bool:
-        return isinstance(data, PointCloud) and data.spatial_rank == 2
+        return data.is_point_cloud and data.spatial_rank == 2
 
-    def plot(self, data: SampledField, figure, subplot, space: Box, min_val: float, max_val: float, show_color_bar: bool, color: Tensor, alpha: Tensor):
+    def plot(self, data: SampledField, figure, subplot, space: Box, min_val: float, max_val: float, show_color_bar: bool, color: Tensor, alpha: Tensor, err: Tensor):
         if isinstance(data.elements, GeometryStack):
             for idx in data.elements.geometries.shape[0].meshgrid():
-                self.plot(data[idx], figure, subplot, space, min_val, max_val, show_color_bar, color[idx], alpha)
+                self.plot(data[idx], figure, subplot, space, min_val, max_val, show_color_bar, color[idx], alpha, err)
             return
         row, col = subplot
         subplot = figure.get_subplot(row, col)
@@ -242,9 +238,9 @@ class PointCloud2D(Recipe):
 class PointCloud3D(Recipe):
 
     def can_plot(self, data: SampledField, space: Box) -> bool:
-        return isinstance(data, PointCloud) and data.spatial_rank == 3
+        return data.is_point_cloud and data.spatial_rank == 3
 
-    def plot(self, data: SampledField, figure, subplot, space: Box, min_val: float, max_val: float, show_color_bar: bool, color: Tensor, alpha: Tensor):
+    def plot(self, data: SampledField, figure, subplot, space: Box, min_val: float, max_val: float, show_color_bar: bool, color: Tensor, alpha: Tensor, err: Tensor):
         row, col = subplot
         subplot = figure.get_subplot(row, col)
         dims = data.bounds.vector.item_names

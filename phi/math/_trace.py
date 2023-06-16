@@ -4,10 +4,11 @@ from typing import Callable, Dict, Set, Tuple, Union
 import numpy
 import numpy as np
 
+from ._ops import choose_backend_t
 from .backend import choose_backend, NUMPY, Backend
 from ._shape import Shape, parse_dim_order, merge_shapes, spatial, instance, batch, concat_shapes, EMPTY_SHAPE, dual, channel, non_batch
 from ._magic_ops import stack, expand
-from ._tensors import Tensor, wrap, disassemble_tree, disassemble_tensors, assemble_tree, CollapsedTensor, TensorStack
+from ._tensors import Tensor, wrap, disassemble_tree, disassemble_tensors, assemble_tree, TensorStack, may_vary_along
 from ._sparse import SparseCoordinateTensor
 from . import _ops as math
 
@@ -72,7 +73,8 @@ class ShiftLinTracer(Tensor):
         This includes `pattern_dims` as well as dimensions along which only the values vary.
         These dimensions cannot be parallelized trivially with a non-batched matrix.
         """
-        return self.pattern_dim_names | set(sum([t.shape.names for t in self.val.values()], ())) | set(self.bias.shape.names)
+        bias_dims = [dim for dim in self.bias.shape.names if may_vary_along(self.bias, dim)]
+        return self.pattern_dim_names | set(sum([t.shape.names for t in self.val.values()], ())) | set(bias_dims)
 
     @property
     def pattern_dim_names(self) -> Set[str]:
@@ -262,8 +264,7 @@ def matrix_from_function(f: Callable,
     aux_args = {k: v for k, v in all_args.items() if k in aux}
     trace_args = {k: v for k, v in all_args.items() if k not in aux}
     tree, tensors = disassemble_tree(trace_args)
-    # tracing = not math.all_available(*tensors)
-    natives, shapes, native_dims = disassemble_tensors(tensors, expand=False)
+    target_backend = choose_backend_t(*tensors)
     # --- Trace function ---
     with NUMPY:
         src = TracerSource(tensors[0].shape, tensors[0].dtype, tuple(trace_args.keys())[0], 0)
@@ -277,14 +278,14 @@ def matrix_from_function(f: Callable,
     # --- Convert to COO ---
     if sparsify_batch is None:
         if auto_compress:
-            sparsify_batch = not tracer.default_backend.supports(Backend.csr_matrix_batched)
+            sparsify_batch = not target_backend.supports(Backend.csr_matrix_batched)
         else:
-            sparsify_batch = not tracer.default_backend.supports(Backend.sparse_coo_tensor_batched)
+            sparsify_batch = not target_backend.supports(Backend.sparse_coo_tensor_batched)
     matrix, bias = tracer_to_coo(tracer, sparsify_batch, separate_independent)
     # --- Compress ---
     if not auto_compress:
         return matrix, bias
-    if matrix.default_backend.supports(Backend.mul_csr_dense):
+    if matrix.default_backend.supports(Backend.mul_csr_dense) and target_backend.supports(Backend.mul_csr_dense):
         return matrix.compress_rows(), bias
     # elif backend.supports(Backend.mul_csc_dense):
     #     return matrix.compress_cols(), tracer.bias
@@ -293,10 +294,10 @@ def matrix_from_function(f: Callable,
     
 
 def tracer_to_coo(tracer: Tensor, sparsify_batch: bool, separate_independent: bool):
-    if isinstance(tracer, CollapsedTensor):
-        tracer = tracer._cached if tracer.is_cached else tracer._inner  # ignore collapsed dimensions. Alternatively, we could expand the result
-        return tracer_to_coo(tracer, sparsify_batch, separate_independent)
-    elif isinstance(tracer, TensorStack):  # This indicates separable solves
+    # if isinstance(tracer, CollapsedTensor):
+    #     tracer = tracer._cached if tracer.is_cached else tracer._inner  # ignore collapsed dimensions. Alternatively, we could expand the result
+    #     return tracer_to_coo(tracer, sparsify_batch, separate_independent)
+    if isinstance(tracer, TensorStack):  # This indicates separable solves
         matrices, biases = zip(*[tracer_to_coo(t, sparsify_batch, separate_independent) for t in tracer._tensors])
         bias = stack(biases, tracer._stack_dim)
         if not separate_independent:
@@ -305,7 +306,7 @@ def tracer_to_coo(tracer: Tensor, sparsify_batch: bool, separate_independent: bo
             values = math.concat_tensor([m._values for m in matrices], 'entries')
             # matrix = stack(matrices, tracer._stack_dim)
             dense_shape = concat_shapes(matrices[0]._dense_shape, tracer._stack_dim)
-            matrix = SparseCoordinateTensor(indices, values, dense_shape, can_contain_double_entries=False, indices_sorted=False)
+            matrix = SparseCoordinateTensor(indices, values, dense_shape, can_contain_double_entries=False, indices_sorted=False, default=0)
         else:
             matrix = stack(matrices, tracer._stack_dim)
         return matrix, bias
@@ -328,7 +329,7 @@ def tracer_to_coo(tracer: Tensor, sparsify_batch: bool, separate_independent: bo
     values = []
     for shift_, shift_val in tracer.val.items():
         if shift_val.default_backend is NUMPY:  # sparsify stencil further
-            native_shift_values = math.reshaped_native(shift_val, [batch_val, *out_shape], force_expand=True)
+            native_shift_values = math.reshaped_native(shift_val, [batch_val, *out_shape])
             mask = np.sum(abs(native_shift_values), 0)  # only 0 where no batch entry has a non-zero value
             out_idx = numpy.nonzero(mask)
             src_idx = [(component + shift_.get_size(dim) if dim in shift_ else component) % typed_src_shape.get_size(dim) for component, dim in zip(out_idx, out_shape)]
@@ -336,7 +337,7 @@ def tracer_to_coo(tracer: Tensor, sparsify_batch: bool, separate_independent: bo
         else:  # add full stencil tensor
             out_idx = np.unravel_index(np.arange(out_shape.volume), out_shape.sizes) if out_shape else 0
             src_idx = [(component + shift_.get_size(dim) if dim in shift_ else component) % typed_src_shape.get_size(dim) for component, dim in zip(out_idx, out_shape)]
-            values.append(math.reshaped_native(shift_val, [batch_val, out_shape], force_expand=True))
+            values.append(math.reshaped_native(shift_val, [batch_val, out_shape]))
         out_indices.append(out_idx)
         src_idx_all = []
         for dim in typed_src_shape:
@@ -350,7 +351,7 @@ def tracer_to_coo(tracer: Tensor, sparsify_batch: bool, separate_independent: bo
     indices_np = np.concatenate([np.concatenate(src_indices, axis=1), np.concatenate(out_indices, axis=1)]).T
     indices = wrap(indices_np, instance('entries'), channel(vector=(sliced_src_shape if separate_independent else src_shape).names + out_shape.names))
     backend = choose_backend(*values)
-    values = math.reshaped_tensor(backend.concat(values, axis=-1), [batch_val, instance('entries')])
+    values = math.reshaped_tensor(backend.concat(values, axis=-1), [batch_val, instance('entries')], convert=False)
     dense_shape = concat_shapes((sliced_src_shape if separate_independent else src_shape) & out_shape)
-    matrix = SparseCoordinateTensor(indices, values, dense_shape, can_contain_double_entries=False, indices_sorted=False)
+    matrix = SparseCoordinateTensor(indices, values, dense_shape, can_contain_double_entries=False, indices_sorted=False, default=0)
     return matrix, tracer.bias

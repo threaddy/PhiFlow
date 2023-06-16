@@ -1,22 +1,22 @@
 import time
 import uuid
 import warnings
-from typing import Callable, Generic, List, TypeVar, Any, Tuple, Union
+from typing import Callable, Generic, List, TypeVar, Any, Tuple, Union, Optional
 
 import numpy
 import numpy as np
 
-from .backend import get_precision
-from ._shape import EMPTY_SHAPE, Shape, merge_shapes, batch, non_batch, shape, dual, channel, non_dual
+from .backend import get_precision, NUMPY
+from ._shape import EMPTY_SHAPE, Shape, merge_shapes, batch, non_batch, shape, dual, channel, non_dual, instance, spatial
 from ._magic_ops import stack, copy_with, rename_dims, unpack_dim
-from ._sparse import native_matrix, SparseCoordinateTensor, CompressedSparseMatrix
+from ._sparse import native_matrix, SparseCoordinateTensor, CompressedSparseMatrix, stored_values, is_sparse
 from ._tensors import Tensor, disassemble_tree, assemble_tree, wrap, cached, NativeTensor, layout
 from . import _ops as math
 from ._ops import choose_backend_t, zeros_like, all_available, reshaped_native, reshaped_tensor, to_float, reshaped_numpy
-from ._functional import custom_gradient, LinearFunction, f_name
+from ._functional import custom_gradient, LinearFunction, f_name, _TRACING_JIT
 from .backend import Backend
-from .backend._backend import SolveResult, PHI_LOGGER
-
+from .backend._backend import SolveResult, PHI_LOGGER, choose_backend, default_backend, convert, Preconditioner
+from .backend._linalg import IncompleteLU, incomplete_lu_dense, incomplete_lu_coo, coarse_explicit_preconditioner_coo
 
 X = TypeVar('X')
 Y = TypeVar('Y')
@@ -36,6 +36,7 @@ class Solve(Generic[X, Y]):
                  suppress: Union[tuple, list] = (),
                  preprocess_y: Callable = None,
                  preprocess_y_args: tuple = (),
+                 preconditioner: Optional[str] = None,
                  gradient_solve: Union['Solve[Y, X]', None] = None):
         method = method or 'auto'
         assert isinstance(method, str)
@@ -61,6 +62,7 @@ class Solve(Generic[X, Y]):
         assert all(issubclass(err, ConvergenceException) for err in suppress)
         self.suppress: tuple = tuple(suppress)
         """ Error types to suppress; `tuple` of `ConvergenceException` types. For these errors, the solve function will instead return the partial result without raising the error. """
+        self.preconditioner = preconditioner
         self._gradient_solve: Solve[Y, X] = gradient_solve
         self.id = str(uuid.uuid4())  # not altered by copy_with(), so that the lookup SolveTape[Solve] works after solve has been copied
 
@@ -268,14 +270,23 @@ class SolveTape:
     >>> result: SolveInfo = solves[0]  # get by index
     """
 
-    def __init__(self, record_trajectories=False):
+    def __init__(self, *solves: Solve, record_trajectories=False):
         """
         Args:
+            *solves: (Optional) Select specific `solves` to be recorded.
+                If none is given, records all solves that occur within the scope of this `SolveTape`.
             record_trajectories: When enabled, the entries of `SolveInfo` will contain an additional batch dimension named `trajectory`.
         """
+        self.record_only_ids = [s.id for s in solves]
         self.record_trajectories = record_trajectories
         self.solves: List[SolveInfo] = []
-        self.solve_ids: List[str] = []
+
+    def should_record_trajectory_for(self, solve: Solve):
+        if not self.record_trajectories:
+            return False
+        if not self.record_only_ids:
+            return True
+        return solve.id in self.record_only_ids
 
     def __enter__(self):
         _SOLVE_TAPES.append(self)
@@ -287,6 +298,8 @@ class SolveTape:
     def _add(self, solve: Solve, trj: bool, result: SolveInfo):
         if any(s.solve.id == solve.id for s in self.solves):
             warnings.warn("SolveTape contains two results for the same solve settings. SolveTape[solve] will return the first solve result.", RuntimeWarning)
+        if self.record_only_ids and solve.id not in self.record_only_ids:
+            return  # this solve should not be recorded
         if self.record_trajectories:
             assert trj, "Solve did not record a trajectory."
             self.solves.append(result)
@@ -294,7 +307,6 @@ class SolveTape:
             self.solves.append(result.snapshot(-1))
         else:
             self.solves.append(result)
-        self.solve_ids.append(solve.id)
 
     def __getitem__(self, item) -> SolveInfo:
         if isinstance(item, int):
@@ -358,7 +370,7 @@ def minimize(f: Callable[[X], Y], solve: Solve[X, Y]) -> X:
     for t in x0_tensors:
         t._expand()
         assert t.shape.is_uniform
-        x0_natives.append(reshaped_native(t, [batch_dims, t.shape.non_batch], force_expand=True))
+        x0_natives.append(reshaped_native(t, [batch_dims, t.shape.non_batch]))
     x0_flat = backend.concat(x0_natives, -1)
 
     def unflatten_assemble(x_flat, additional_dims: Shape = EMPTY_SHAPE, convert=True):
@@ -381,14 +393,14 @@ def minimize(f: Callable[[X], Y], solve: Solve[X, Y]) -> X:
         _, y_tensors = disassemble_tree(y)
         assert not non_batch(y_tensors[0]), f"Failed to minimize '{f.__name__}' because it returned a non-scalar output {shape(y_tensors[0])}. Reduce all non-batch dimensions, e.g. using math.l2_loss()"
         try:
-            loss_native = reshaped_native(y_tensors[0], [batch_dims])
+            loss_native = reshaped_native(y_tensors[0], [batch_dims], force_expand=False)
         except AssertionError:
             raise AssertionError(f"Failed to minimize '{f.__name__}' because its output loss {shape(y_tensors[0])} has more batch dimensions than the initial guess {batch_dims}.")
         return y_tensors[0].sum, (loss_native,)
 
-    atol = backend.to_float(reshaped_native(solve.abs_tol, [batch_dims], force_expand=True))
-    maxi = reshaped_numpy(solve.max_iterations, [batch_dims], force_expand=True)
-    trj = _SOLVE_TAPES and any(t.record_trajectories for t in _SOLVE_TAPES)
+    atol = backend.to_float(reshaped_native(solve.abs_tol, [batch_dims]))
+    maxi = reshaped_numpy(solve.max_iterations, [batch_dims])
+    trj = _SOLVE_TAPES and any(t.should_record_trajectory_for(solve) for t in _SOLVE_TAPES)
     t = time.perf_counter()
     ret = backend.minimize(solve.method, native_function, x0_flat, atol, maxi, trj)
     t = time.perf_counter() - t
@@ -470,9 +482,13 @@ def solve_linear(f: Union[Callable[[X], Y], Tensor],
     * `'auto'`: Automatically choose a solver
     * `'CG'`: Conjugate gradient, only for symmetric and positive definite matrices.
     * `'CG-adaptive'`: Conjugate gradient with adaptive step size, only for symmetric and positive definite matrices.
-    * `'biCG'`: Biconjugate gradient
-    * `'biCGstab'`: Biconjugate gradient stabilized, first order
-    * `'biCGstab(2)'`: Biconjugate gradient stabilized, second order
+    * `'biCG'` or `'biCG-stab(0)'`: Biconjugate gradient
+    * `'biCG-stab'` or `'biCG-stab(1)'`: Biconjugate gradient stabilized, first order
+    * `'biCG-stab(2)'`, `'biCG-stab(4)'`, ...: Biconjugate gradient stabilized, second or higher order
+    * `'scipy-direct'`: SciPy direct solve always run oh the CPU using `scipy.sparse.linalg.spsolve`.
+    * `'scipy-CG'`, `'scipy-GMres'`, `'scipy-biCG'`, `'scipy-biCG-stab'`, `'scipy-CGS'`, `'scipy-QMR'`, `'scipy-GCrotMK'`: SciPy iterative solvers always run oh the CPU.
+
+    **Caution**: SciPy solvers cannot be jit-compiled and should only be used for debugging purposes.
 
     For maximum performance, compile `f` using `jit_compile_linear()` beforehand.
     Then, an optimized representation of `f` (such as a sparse matrix) will be used to solve the linear system.
@@ -525,20 +541,22 @@ def solve_linear(f: Union[Callable[[X], Y], Tensor],
         else:
             matrix = f
             bias = 0
+        preconditioner = compute_preconditioner(solve.preconditioner, matrix, safe=False, target_backend=NUMPY if solve.method.startswith('scipy-') else backend, solver=solve.method) if solve.preconditioner is not None else None
 
         def _matrix_solve_forward(y, solve: Solve, matrix: Tensor, is_backprop=False):
-            backend_matrix = native_matrix(matrix)
+            backend_matrix = native_matrix(matrix, choose_backend_t(*y_tensors, matrix))
             pattern_dims_in = channel(**dual(matrix).untyped_dict).names
             pattern_dims_out = non_dual(matrix).names  # batch dims can be sparse or batched matrices
-            result = _linear_solve_forward(y, solve, backend_matrix, pattern_dims_in, pattern_dims_out, backend, is_backprop)
+            result = _linear_solve_forward(y, solve, backend_matrix, pattern_dims_in, pattern_dims_out, preconditioner, backend, is_backprop)
             return result  # must return exactly `x` so gradient isn't computed w.r.t. other quantities
 
-        _matrix_solve = attach_gradient_solve(_matrix_solve_forward, auxiliary_args='is_backprop,solve', matrix_adjoint=grad_for_f)
+        _matrix_solve = attach_gradient_solve(_matrix_solve_forward, auxiliary_args=f'is_backprop,solve{",matrix" if matrix.default_backend == NUMPY else ""}', matrix_adjoint=grad_for_f)
         return _matrix_solve(y - bias, solve, matrix)
     else:  # Matrix-free solve
         f_args = cached(f_args)
         solve = cached(solve)
         assert not grad_for_f, f"grad_for_f=True can only be used for math.jit_compile_linear functions but got '{f_name(f)}'. Please decorate the linear function with @jit_compile_linear"
+        assert solve.preconditioner is None, f"Preconditioners not currently supported for matrix-free solves. Decorate '{f_name(f)}' with @math.jit_compile_linear to perform a matrix solve."
 
         def _function_solve_forward(y, solve: Solve, f_args: tuple, f_kwargs: dict = None, is_backprop=False):
             y_nest, (y_tensor,) = disassemble_tree(y)
@@ -557,7 +575,7 @@ def solve_linear(f: Union[Callable[[X], Y], Tensor],
                     y_native = y_native[batch_index]
                 return y_native
 
-            result = _linear_solve_forward(y, solve, native_lin_f, pattern_dims_in=non_batch(x0_tensor).names, pattern_dims_out=non_batch(y_tensor).names, backend=backend, is_backprop=is_backprop)
+            result = _linear_solve_forward(y, solve, native_lin_f, pattern_dims_in=non_batch(x0_tensor).names, pattern_dims_out=non_batch(y_tensor).names, preconditioner=None, backend=backend, is_backprop=is_backprop)
             return result  # must return exactly `x` so gradient isn't computed w.r.t. other quantities
 
         _function_solve = attach_gradient_solve(_function_solve_forward, auxiliary_args='is_backprop,f_kwargs,solve', matrix_adjoint=grad_for_f)
@@ -566,9 +584,10 @@ def solve_linear(f: Union[Callable[[X], Y], Tensor],
 
 def _linear_solve_forward(y,
                           solve: Solve,
-                          native_lin_op,
+                          native_lin_op: Union[Callable, Any],  # native function or native matrix
                           pattern_dims_in: Tuple[str, ...],
                           pattern_dims_out: Tuple[str, ...],
+                          preconditioner: Optional[Callable],
                           backend: Backend,
                           is_backprop: bool) -> Any:
     solve = solve.with_defaults('solve')
@@ -580,19 +599,17 @@ def _linear_solve_forward(y,
     pattern_dims_in = x0_tensor.shape.only(pattern_dims_in, reorder=True)
     pattern_dims_out = y_tensor.shape.only(pattern_dims_out, reorder=True)
     batch_dims = merge_shapes(y_tensor.shape.without(pattern_dims_out), x0_tensor.shape.without(pattern_dims_in))
-    x0_native = backend.as_tensor(reshaped_native(x0_tensor, [batch_dims, pattern_dims_in], force_expand=True))
-    y_native = backend.as_tensor(reshaped_native(y_tensor, [batch_dims, y_tensor.shape.only(pattern_dims_out)], force_expand=True))
-    rtol = backend.as_tensor(reshaped_native(math.to_float(solve.rel_tol), [batch_dims], force_expand=True))
-    atol = backend.as_tensor(reshaped_native(solve.abs_tol, [batch_dims], force_expand=True))
-    tol_sq = backend.maximum(rtol ** 2 * backend.sum(y_native ** 2, -1), atol ** 2)
-    trj = _SOLVE_TAPES and any(t.record_trajectories for t in _SOLVE_TAPES)
+    x0_native = backend.as_tensor(reshaped_native(x0_tensor, [batch_dims, pattern_dims_in]))
+    y_native = backend.as_tensor(reshaped_native(y_tensor, [batch_dims, y_tensor.shape.only(pattern_dims_out)]))
+    rtol = backend.as_tensor(reshaped_native(math.to_float(solve.rel_tol), [batch_dims]))
+    atol = backend.as_tensor(reshaped_native(solve.abs_tol, [batch_dims]))
+    trj = _SOLVE_TAPES and any(t.should_record_trajectory_for(solve) for t in _SOLVE_TAPES)
     if trj:
-        assert all_available(y_tensor, x0_tensor), "Cannot record linear solve in jit mode"
         max_iter = np.expand_dims(np.arange(int(solve.max_iterations)+1), -1)
     else:
-        max_iter = reshaped_numpy(solve.max_iterations, [shape(solve.max_iterations).without(batch_dims), batch_dims], force_expand=True)
+        max_iter = reshaped_numpy(solve.max_iterations, [shape(solve.max_iterations).without(batch_dims), batch_dims])
     t = time.perf_counter()
-    ret = backend.linear_solve(solve.method, native_lin_op, y_native, x0_native, tol_sq, max_iter)
+    ret = backend.linear_solve(solve.method, native_lin_op, y_native, x0_native, rtol, atol, max_iter, preconditioner)
     t = time.perf_counter() - t
     trj_dims = [batch(trajectory=len(max_iter))] if trj else []
     assert isinstance(ret, SolveResult)
@@ -659,3 +676,132 @@ def attach_gradient_solve(forward_solve: Callable, auxiliary_args: str, matrix_a
     solve_with_grad = custom_gradient(forward_solve, implicit_gradient_solve, auxiliary_args=auxiliary_args)
     return solve_with_grad
 
+
+def compute_preconditioner(method: str, matrix: Tensor, safe=False, target_backend: Backend = None, solver: str = None) -> Optional[Preconditioner]:
+    if method == 'auto':
+        target_backend = target_backend or default_backend()
+        # is_cpu = target_backend.get_default_device().device_type == 'CPU'
+        # if tracing and not Backend.supports(Backend.python_call) -> cannot use ILU
+        native_triangular = target_backend.supports(Backend.solve_triangular_sparse) if is_sparse(matrix) else target_backend.supports(Backend.solve_triangular_dense)
+        if solver in ['direct', 'scipy-direct']:
+            method = None
+        elif native_triangular:
+            method = 'ilu'
+        elif spatial(matrix):
+            method = 'cluster'
+        else:
+            method = None
+        PHI_LOGGER.info(f"Auto-selecting preconditioner '{method}' for '{solver}' on {target_backend}")
+    if method == 'ilu':
+        n = dual(matrix).volume
+        entry_count = stored_values(matrix).shape.volume
+        avg_entries_per_element = entry_count / n
+        d = (avg_entries_per_element - 1) / 2
+        if _TRACING_JIT and matrix.available:
+            iterations = int(math.ceil(n ** (1 / d)))  # high-quality preconditioner when jit-compiling with constant matrix
+            PHI_LOGGER.debug(f"factor_ilu: auto-selecting iterations={iterations} (constant matrix) for matrix {matrix}")
+        else:
+            iterations = int(math.ceil(math.sqrt(d * n ** (1 / d))))  # in 1D take sqrt(n), in 2D take sqrt(2*n**1/2)
+            PHI_LOGGER.debug(f"factor_ilu: auto-selecting iterations={iterations} ({'variable matrix' if _TRACING_JIT else 'eager mode'}) for matrix {matrix}")
+        lower, upper = factor_ilu(matrix, iterations, safe=safe)
+        native_lower = native_matrix(lower, target_backend)
+        native_upper = native_matrix(upper, target_backend)
+        native_lower = convert(native_lower, target_backend)
+        native_upper = convert(native_upper, target_backend)
+        return IncompleteLU(native_lower, True, native_upper, False, rank_deficiency=0, source=f"iter={iterations}")  # ToDo rank deficiency
+    elif method == 'cluster':
+        return explicit_coarse(matrix, target_backend)
+    elif method is None:
+        return None
+    raise NotImplementedError
+
+
+def factor_ilu(matrix: Tensor, iterations: int, safe=False):
+    """
+    Incomplete LU factorization for dense or sparse matrices.
+
+    For sparse matrices, keeps the sparsity pattern of `matrix`.
+    L and U will be trimmed to the respective areas, i.e. stored upper elements in L will be dropped,
+     unless this would lead to varying numbers of stored elements along a batch dimension.
+
+    Args:
+        matrix: Dense or sparse matrix to factor.
+            Currently, compressed sparse matrices are decompressed before running the ILU algorithm.
+        iterations: (Optional) Number of fixed-point iterations to perform.
+            If not given, will be automatically determined from matrix size and sparsity.
+        safe: If `False` (default), only matrices with a rank deficiency of up to 1 can be factored as all values of L and U are uniquely determined.
+            For matrices with higher rank deficiencies, the result includes `NaN` values.
+            If `True`, the algorithm runs slightly slower but can factor highly rank-deficient matrices as well.
+            However, then L is undeterdetermined and unused values of L are set to 0.
+            Rank deficiencies of 1 occur frequently in periodic settings but higher ones are rare.
+
+    Returns:
+        L: Lower-triangular matrix as `Tensor` with all diagonal elements equal to 1.
+        U: Upper-triangular matrix as `Tensor`.
+
+    Examples:
+        >>> matrix = wrap([[-2, 1, 0],
+        >>>                [1, -2, 1],
+        >>>                [0, 1, -2]], channel('row'), dual('col'))
+        >>> L, U = math.factor_ilu(matrix)
+        >>> math.print(L)
+        row=0      1.          0.          0.         along ~col
+        row=1     -0.5         1.          0.         along ~col
+        row=2      0.         -0.6666667   1.         along ~col
+        >>> math.print(L @ U, "L @ U")
+                    L @ U
+        row=0     -2.   1.   0.  along ~col
+        row=1      1.  -2.   1.  along ~col
+        row=2      0.   1.  -2.  along ~col
+    """
+    if isinstance(matrix, CompressedSparseMatrix):
+        matrix = matrix.decompress()
+    if isinstance(matrix, SparseCoordinateTensor):
+        ind_batch, channels, indices, values, shape = matrix._native_coo_components(dual, matrix=True)
+        (l_idx_nat, l_val_nat), (u_idx_nat, u_val_nat) = incomplete_lu_coo(indices, values, shape, iterations, safe)
+        col_dims = matrix._shape.only(dual)
+        row_dims = matrix._dense_shape.without(col_dims)
+        l_indices = matrix._unpack_indices(l_idx_nat[..., 0], l_idx_nat[..., 1], row_dims, col_dims, ind_batch)
+        u_indices = matrix._unpack_indices(u_idx_nat[..., 0], u_idx_nat[..., 1], row_dims, col_dims, ind_batch)
+        l_values = reshaped_tensor(l_val_nat, [ind_batch, instance(matrix._values), channels], convert=False)
+        u_values = reshaped_tensor(u_val_nat, [ind_batch, instance(matrix._values), channels], convert=False)
+        lower = SparseCoordinateTensor(l_indices, l_values, matrix._dense_shape, matrix._can_contain_double_entries, matrix._indices_sorted, matrix._default)
+        upper = SparseCoordinateTensor(u_indices, u_values, matrix._dense_shape, matrix._can_contain_double_entries, matrix._indices_sorted, matrix._default)
+    else:  # dense matrix
+        native_matrix = reshaped_native(matrix, [batch, non_batch(matrix).non_dual, dual, EMPTY_SHAPE])
+        l_native, u_native = incomplete_lu_dense(native_matrix, iterations, safe)
+        lower = reshaped_tensor(l_native, [batch(matrix), non_batch(matrix).non_dual, dual(matrix), EMPTY_SHAPE])
+        upper = reshaped_tensor(u_native, [batch(matrix), non_batch(matrix).non_dual, dual(matrix), EMPTY_SHAPE])
+    return lower, upper
+
+
+def explicit_coarse(matrix: Tensor,
+                    target_backend: Backend,
+                    cluster_count=3 ** 6,
+                    cluster_hint=None):
+    b0 = matrix.default_backend
+    cols = dual(matrix).volume
+    # --- cluster entries ---
+    if cluster_count >= cols:  # 1 cluster per element
+        cluster_count = cols
+        clusters = b0.to_int32(b0.linspace_without_last(0, cluster_count, cols))[None, :]
+    elif spatial(matrix) and not instance(matrix):  # cell clusters
+        axes = spatial(matrix)
+        with matrix.default_backend:
+            clusters_by_axis = np.round(np.asarray(axes.sizes) * (cluster_count / axes.volume) ** (1/axes.rank)).astype(np.int32)
+            cluster_count = int(np.prod(clusters_by_axis))
+            clusters_nd = math.meshgrid(axes) / axes * clusters_by_axis
+            clusters_nd = math.to_int32(clusters_nd)
+            clusters = math.reshaped_native(clusters_nd, [batch, spatial(matrix), 'vector'])
+            clusters = b0.ravel_multi_index(clusters, clusters_by_axis)
+    else:  # arbitrary clusters
+        assert cluster_hint is not None
+        raise NotImplementedError(f"Clustering currently only supported for grids but got matrix with shape {matrix.shape}")
+    # --- build preconditioner ---
+    if isinstance(matrix, CompressedSparseMatrix):
+        matrix = matrix.decompress()
+    if isinstance(matrix, SparseCoordinateTensor):
+        ind_batch, channels, indices, values, shape = matrix._native_coo_components(dual, matrix=True)
+        return coarse_explicit_preconditioner_coo(target_backend, indices, values, shape, clusters, cluster_count)
+    else:  # dense matrix
+        raise NotImplementedError

@@ -1,17 +1,14 @@
-from functools import partial
-from typing import Tuple, Optional, List, Union
+from typing import Tuple, Optional, Union
 
 import numpy as np
 
-from ._shape import Shape, channel, batch, spatial, DimFilter, parse_dim_order, shape, instance
-from .magic import PhiTreeNode
-from ._magic_ops import stack, rename_dims, concat, variable_values
-from ._tensors import Tensor, wrap, tensor
-from . import extrapolation as extrapolation
-from .extrapolation import Extrapolation
 from . import _ops as math
-from ._functional import jit_compile_linear
-from ._optimize import solve_linear
+from . import extrapolation as extrapolation
+from ._magic_ops import stack, rename_dims, concat, variable_values
+from ._shape import Shape, channel, batch, spatial, DimFilter, parse_dim_order, shape, instance
+from ._tensors import Tensor, wrap, tensor
+from .extrapolation import Extrapolation
+from .magic import PhiTreeNode
 
 
 def vec(name: Union[str, Shape] = 'vector', *sequence, tuple_dim=spatial('sequence'), list_dim=instance('sequence'), **components) -> Tensor:
@@ -418,7 +415,7 @@ def masked_fill(values: Tensor, valid: Tensor, distance: int = 1) -> Tuple[Tenso
         valid: mask marking all valid values after extrapolation
     """
     def binarize(x):
-        return math.divide_no_nan(x, x)
+        return math.safe_div(x, x)
     distance = min(distance, max(values.shape.sizes))
     for _ in range(distance):
         valid = binarize(valid)
@@ -429,7 +426,7 @@ def masked_fill(values: Tensor, valid: Tensor, distance: int = 1) -> Tuple[Tenso
             valid_values = math.sum_(values_l + values_r + valid_values, dim='shift')
             mask_l, mask_r = shift(overlap, (-1, 1), dims=dim, padding=extrapolation.ZERO)
             overlap = math.sum_(mask_l + mask_r + overlap, dim='shift')
-        extp = math.divide_no_nan(valid_values, overlap)  # take mean where extrapolated values overlap
+        extp = math.safe_div(valid_values, overlap)  # take mean where extrapolated values overlap
         values = math.where(valid, values, math.where(binarize(overlap), extp, values))
         valid = overlap
     return values, binarize(valid)
@@ -528,7 +525,7 @@ def spatial_gradient(grid: Tensor,
 
 def laplace(x: Tensor,
             dx: Union[Tensor, float] = 1,
-            padding: Extrapolation = extrapolation.BOUNDARY,
+            padding: Union[Extrapolation, float, Tensor] = extrapolation.BOUNDARY,
             dims: DimFilter = spatial,
             weights: Tensor = None):
     """
@@ -611,7 +608,7 @@ def fourier_poisson(grid: Tensor,
     k_squared = math.sum_(math.fftfreq(grid.shape) ** 2, 'vector')
     fft_laplace = -(2 * np.pi) ** 2 * k_squared
     # fft_laplace.tensor[(0,) * math.ndims(k_squared)] = math.inf  # assume NumPy array to edit
-    result = math.real(math.ifft(math.divide_no_nan(frequencies, math.to_complex(fft_laplace ** times))))
+    result = math.real(math.ifft(math.safe_div(frequencies, math.to_complex(fft_laplace ** times))))
     return math.cast(result * wrap(dx) ** 2, grid.dtype)
 
 
